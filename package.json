@@ -1,0 +1,22 @@
+{
+  "name": "legacy-ai-back",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "predev": "node scripts/free-port.js",
+    "dev": "node --watch src/index.js",
+    "start": "node src/index.js",
+    "setup-db": "node scripts/setup-db.js"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "dependencies": {
+    "@supabase/supabase-js": "^2.49.1",
+    "cors": "^2.8.5",
+    "dotenv": "^16.4.7",
+    "express": "^4.21.2",
+    "pg": "^8.13.3"
+  }
+}
