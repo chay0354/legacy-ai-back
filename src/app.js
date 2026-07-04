@@ -52,12 +52,17 @@ export function createApp() {
   const app = express();
   const allowed = corsOrigins();
 
-  app.use(cors({
+  const corsOptions = {
     origin(origin, callback) {
       callback(null, isAllowedOrigin(origin, allowed));
     },
     credentials: true,
-  }));
+    methods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],
+    allowedHeaders: ['Content-Type', 'Authorization'],
+  };
+
+  app.use(cors(corsOptions));
+  app.options(/.*/, cors(corsOptions));
   app.use(express.json({ limit: '12mb' }));
 
   const supabase = createClient(
