@@ -1,4 +1,5 @@
 import { getPool } from '../db/pool.js';
+import { filterNewMemories } from '../services/memoryDedupe.js';
 
 export async function getOrCreateCreatorPg(userId, displayName) {
   const db = getPool();
@@ -95,7 +96,14 @@ export async function saveExtractionPg(creatorId, sessionId, extracted) {
     await client.query('BEGIN');
 
     if (extracted.memories?.length) {
-      for (const m of extracted.memories) {
+      const { rows: existingRows } = await client.query(
+        'SELECT title, year, summary FROM legacy_memories WHERE creator_id = $1',
+        [creatorId],
+      );
+      const memories = filterNewMemories(extracted.memories, existingRows);
+      extracted.memories = memories;
+
+      for (const m of memories) {
         await client.query(
           `INSERT INTO legacy_memories (creator_id, session_id, title, summary, full_transcript, category, tags, people_involved, location, age, year, year_confidence, emotional_significance, lesson_learned, importance)
            VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15)`,

@@ -112,10 +112,11 @@ export async function conductorTurn(params) {
     userMessage: buildUserMessage(params),
     maxTokens: 1024,
   });
+  const text = typeof raw === 'string' ? raw : raw.text;
 
   let parsed;
   try {
-    parsed = parseJsonFromClaude(raw);
+    parsed = parseJsonFromClaude(text);
   } catch {
     throw new Error('Interviewer returned invalid response');
   }

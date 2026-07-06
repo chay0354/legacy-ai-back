@@ -1,11 +1,58 @@
-import { callClaude, parseJsonFromClaude } from './anthropic.js';
+import { callClaudeJson } from './anthropic.js';
 import { getExtractionSystem, buildExtractionUserMessage } from './extractionPrompt.js';
 import { saveExtractionPg } from '../db/legacyRepo.js';
-import { stageCompleteLevel } from '../interviewStages.js';
+import { getCoverageCategoriesForStage, stageCompleteLevel } from '../interviewStages.js';
+import { filterNewMemories } from './memoryDedupe.js';
+
+function normalizeAnswers(answers) {
+  return (answers || []).map((a, i) => ({
+    questionIndex: a.question_index ?? a.questionIndex ?? i,
+    question: a.question ?? '',
+    answer: a.answer ?? '',
+    category: a.category ?? 'general',
+    skipped: Boolean(a.skipped),
+    mode: a.answer_mode ?? a.mode ?? 'text',
+  }));
+}
+
+function buildFallbackExtraction(answers, creatorName, stage) {
+  const minLevel = stageCompleteLevel(stage);
+  const categories = getCoverageCategoriesForStage(stage);
+  const coverage = Object.fromEntries(categories.map((c) => [c, 35]));
+  const answered = answers.filter((a) => a.answer?.trim() && !a.skipped);
+
+  return {
+    session_summary: `${creatorName} finished the ${stage} interview with ${answered.length} answer${answered.length === 1 ? '' : 's'} recorded. We saved your responses; detailed story extraction will run again soon.`,
+    recommended_next_topics: [],
+    coverage,
+    completion_score: Math.min(33, 10 + answered.length * 3),
+    avatar_level: minLevel,
+    memories: [],
+    relationships: [],
+    values: [],
+    wisdom: [],
+    threads: [],
+    personality: {},
+  };
+}
+
+async function fetchExistingMemories(supabase, creatorId) {
+  const { data, error } = await supabase
+    .from('legacy_memories')
+    .select('title, year, summary')
+    .eq('creator_id', creatorId);
+  if (error) throw error;
+  return data || [];
+}
 
 async function saveExtractionSupabase(supabase, creatorId, sessionId, extracted, stage = 'foundation') {
   if (extracted.memories?.length) {
-    const rows = extracted.memories.map((m) => ({
+    const existing = await fetchExistingMemories(supabase, creatorId);
+    const memories = filterNewMemories(extracted.memories, existing);
+    extracted.memories = memories;
+
+    if (memories.length) {
+    const rows = memories.map((m) => ({
       creator_id: creatorId,
       session_id: sessionId,
       title: m.title,
@@ -25,6 +72,7 @@ async function saveExtractionSupabase(supabase, creatorId, sessionId, extracted,
     }));
     const { error } = await supabase.from('legacy_memories').insert(rows);
     if (error) throw error;
+    }
   }
 
   if (extracted.relationships?.length) {
@@ -143,20 +191,22 @@ async function saveExtractionSupabase(supabase, creatorId, sessionId, extracted,
 }
 
 export async function processInterviewSession({ supabase, pgMode, sessionId, creatorId, creatorName, answers, stage = 'foundation' }) {
-  if (!answers?.length) throw new Error('No answers to process');
+  const normalized = normalizeAnswers(answers);
+  if (!normalized.length) throw new Error('No answers to process');
 
   const name = creatorName || 'Creator';
   const minLevel = stageCompleteLevel(stage);
-  const raw = await callClaude({
-    system: getExtractionSystem(stage),
-    userMessage: buildExtractionUserMessage(name, answers, stage),
-  });
 
   let extracted;
   try {
-    extracted = parseJsonFromClaude(raw);
-  } catch {
-    throw new Error('AI returned invalid JSON');
+    extracted = await callClaudeJson({
+      system: getExtractionSystem(stage),
+      userMessage: buildExtractionUserMessage(name, normalized, stage),
+      maxTokens: 16384,
+    });
+  } catch (err) {
+    console.error('[interviewProcessor] extraction failed, using fallback:', err.message);
+    extracted = buildFallbackExtraction(normalized, name, stage);
   }
 
   extracted.avatar_level = Math.max(extracted.avatar_level ?? minLevel, minLevel);

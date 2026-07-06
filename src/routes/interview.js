@@ -801,7 +801,7 @@ router.post('/voice/realtime/instructions', (req, res) => {
 router.post('/voice/transcribe', async (req, res) => {
   try {
     if (!openAiConfigured()) {
-      return res.status(503).json({ error: 'OpenAI API not configured (OPENAI_API_KEY)' });
+      return res.status(503).json({ error: 'Voice interview is not available right now.' });
     }
     const { audio, mimeType = 'audio/webm' } = req.body || {};
     if (!audio) return res.status(400).json({ error: 'audio required' });

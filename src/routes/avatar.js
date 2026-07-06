@@ -1,5 +1,5 @@
 import { Router } from 'express';
-import { cloneVoice as elevenLabsClone, textToSpeech as elevenLabsTts, deleteVoice as elevenLabsDeleteVoice } from '../services/elevenlabs.js';
+import { cloneVoice as elevenLabsClone, textToSpeech as elevenLabsTts, deleteVoice as elevenLabsDeleteVoice, isInstantCloneLikelyAvailable, markInstantCloneUnavailable } from '../services/elevenlabs.js';
 import {
   startTalkingVideo,
   startAvatarVideo,
@@ -382,7 +382,7 @@ async function cloneCreatorVoice({ req, creator, voiceSamplePath, buffer, file }
   const voiceName = `Legacy — ${creator.display_name || 'Creator'} (${creator.id.slice(0, 8)})`;
   const samples = await gatherVoiceSamples(req, creator.id, voiceSamplePath, buffer, file);
 
-  if (process.env.ELEVENLABS_API_KEY) {
+  if (await isInstantCloneLikelyAvailable()) {
     try {
       const elVoiceId = await elevenLabsClone({
         name: voiceName,
@@ -396,7 +396,8 @@ async function cloneCreatorVoice({ req, creator, voiceSamplePath, buffer, file }
         heygenVoiceId: null,
       };
     } catch (e) {
-      console.warn('[avatar/voice] ElevenLabs clone failed, trying HeyGen:', e.message);
+      markInstantCloneUnavailable(e);
+      console.warn('[avatar/voice] ElevenLabs clone unavailable, using HeyGen:', e.message);
     }
   }
 
@@ -463,8 +464,8 @@ function isHeyGenCreditsError(err) {
 function heygenCreditsExhaustedError(assets) {
   const liveReady = Boolean(assets?.metadata?.anam_avatar_id && assets?.metadata?.anam_voice_id);
   const msg = liveReady
-    ? 'HeyGen credits are used up, so pre-recorded talking video is unavailable. Use Live Call — your cloned face and voice work there via Anam.'
-    : 'HeyGen credits are used up. Add credits at heygen.com for pre-recorded talking video, or finish Avatar Studio provisioning to enable Live Call.';
+    ? 'Pre-recorded talking video is unavailable right now. Your cloned face and voice still work on Live Call.'
+    : 'Pre-recorded talking video is unavailable right now. Finish Avatar Studio setup to enable Live Call.';
   const err = new Error(msg);
   err.code = 'heygen_credits_exhausted';
   err.liveCallAvailable = liveReady;
@@ -560,9 +561,7 @@ router.post('/voice', async (req, res) => {
       voiceId: cloned.voiceId,
       voiceProvider: cloned.provider,
       cloned: true,
-      warning: cloned.provider === 'heygen' && process.env.ELEVENLABS_API_KEY
-        ? 'ElevenLabs clone failed — using HeyGen voice instead.'
-        : null,
+      message: 'Your voice is cloned and ready for your live avatar.',
       assets: provisioned || saved,
       avatarReady: avatarReady(provisioned || saved),
     });
@@ -713,7 +712,7 @@ router.post('/ask', async (req, res) => {
     if (!creatorId) return res.status(404).json({ error: 'No legacy specified' });
 
     const ctx = await buildAvatarContext(req, creatorId);
-    const answer = await callClaude({
+    const { text: answer } = await callClaude({
       system: buildAvatarSystemPrompt(ctx),
       userMessage: question,
       maxTokens: 400,
@@ -831,7 +830,7 @@ router.post('/say', async (req, res) => {
     let videoId;
     const photoAvatarId = activeAssets.metadata?.heygen_photo_avatar_id;
     const audioOnlyNotice =
-      'HeyGen video credits exhausted. Your cloned voice still plays as audio — use Live Call for real-time face + voice.';
+      'Pre-recorded talking video is unavailable right now. Your cloned voice still plays as audio — use Live Call for real-time face and voice.';
 
     if (buffer) {
       const ext = provider === 'elevenlabs' ? 'mp3' : ttsUrl?.includes('.wav') ? 'wav' : 'mp3';

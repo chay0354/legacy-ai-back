@@ -11,6 +11,51 @@ import { elevenLabsTtsModel, elevenLabsVoiceSettings } from '../config/voice.js'
 
 const BASE_URL = 'https://api.elevenlabs.io/v1';
 
+/** Cached from GET /v1/user/subscription — null = unknown. */
+let instantCloneAvailable = null;
+let subscriptionCache = null;
+let subscriptionCacheAt = 0;
+const SUBSCRIPTION_TTL_MS = 5 * 60 * 1000;
+
+export async function getElevenLabsSubscription(force = false) {
+  if (!process.env.ELEVENLABS_API_KEY) return null;
+  if (!force && subscriptionCache && Date.now() - subscriptionCacheAt < SUBSCRIPTION_TTL_MS) {
+    return subscriptionCache;
+  }
+  const res = await fetch(`${BASE_URL}/user/subscription`, {
+    headers: { 'xi-api-key': apiKey() },
+  });
+  if (!res.ok) return null;
+  subscriptionCache = await res.json();
+  subscriptionCacheAt = Date.now();
+  instantCloneAvailable = subscriptionCache.can_use_instant_voice_cloning === true;
+  return subscriptionCache;
+}
+
+export async function isInstantCloneLikelyAvailable() {
+  if (!process.env.ELEVENLABS_API_KEY) return false;
+  try {
+    const sub = await getElevenLabsSubscription();
+    if (sub) return sub.can_use_instant_voice_cloning === true;
+  } catch {
+    /* fall through */
+  }
+  return instantCloneAvailable !== false;
+}
+
+export function markInstantCloneUnavailable(err) {
+  const code = err?.code;
+  const msg = String(err?.message || '');
+  if (
+    code === 'paid_plan_required'
+    || code === 'can_not_use_instant_voice_cloning'
+    || /instant voice cloning/i.test(msg)
+    || /paid_plan_required/i.test(msg)
+  ) {
+    instantCloneAvailable = false;
+  }
+}
+
 function apiKey() {
   const key = process.env.ELEVENLABS_API_KEY;
   if (!key) throw new Error('ELEVENLABS_API_KEY not configured');
@@ -48,6 +93,7 @@ export async function cloneVoice({ name, sample, samples, description }) {
     const e = new Error(`ElevenLabs clone error ${res.status}: ${errText}`);
     e.code = code;
     e.httpStatus = res.status;
+    markInstantCloneUnavailable(e);
     throw e;
   }
 

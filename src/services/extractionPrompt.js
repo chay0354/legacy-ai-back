@@ -42,10 +42,12 @@ Follow the Legacy Interview Blueprint principles:
 - Coverage is based on whether meaningful questions CAN be answered, not whether all fields are filled.
 - Never invent facts. Only extract what the creator actually said.
 - When the creator mentions a year or when something happened (e.g. "in 1977", "back in '58"), always set memory.year to the 4-digit year and year_confidence to exact or approximate. Create a separate memory for each distinct dated life event.
+- The life timeline is built ONLY from saved memories. Every dated life event must live in the memories array — not in relationships, values, wisdom, or threads alone.
+- Do not duplicate memories: one memory per distinct event. If the same story was captured in a prior session, skip it. Do not re-insert the same title+year or the same story with slightly different wording.
 - Preserve contradictions if present — do not resolve them.
 - Assign importance: low | medium | high | critical for stories and relationships.
 
-Return ONLY valid JSON matching this exact schema:
+Return ONLY valid JSON matching this exact schema (no markdown fences, no text before or after the JSON object):
 {
   "session_summary": "2-3 sentence summary of what was learned this session",
   "recommended_next_topics": ["topic1", "topic2"],
