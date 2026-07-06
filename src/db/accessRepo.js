@@ -222,7 +222,7 @@ function supabaseStore(supabase, admin) {
     },
 
     async getMembership(creatorId, userId) {
-      const { data } = await supabase
+      const { data } = await writer
         .from('legacy_members')
         .select('*')
         .eq('creator_id', creatorId)

@@ -58,7 +58,7 @@ async function getAssetsForViewer(req, creatorId) {
     throw Object.assign(new Error('You do not have access to this legacy'), { status: 403 });
   }
 
-  const { data, error } = await req.admin
+  const { data, error } = await (req.admin || req.supabase)
     .from('legacy_avatar_assets')
     .select('*')
     .eq('creator_id', creatorId)
@@ -89,9 +89,14 @@ async function signedForCreator(req, creatorId, path) {
   let client = req.supabase;
   if (owned?.id !== creatorId) {
     if (!(await viewerCanAccessCreator(req, creatorId))) return null;
-    client = req.admin;
+    client = req.admin || req.supabase;
   }
+  if (!client) return null;
   const { data, error } = await client.storage.from(BUCKET).createSignedUrl(path, 60 * 60);
+  if (error && req.admin && client !== req.admin) {
+    const retry = await req.admin.storage.from(BUCKET).createSignedUrl(path, 60 * 60);
+    if (!retry.error) return retry.data.signedUrl;
+  }
   if (error) {
     console.warn('[avatar] signed URL failed:', path, error.message);
     return null;
@@ -321,6 +326,41 @@ async function provisionAnam(req, creator) {
   }
 }
 
+/* GET /api/avatar/portrait?creatorId= — stream portrait image for any viewer with access. */
+router.get('/portrait', async (req, res) => {
+  try {
+    const creatorId = (req.query.creatorId || '').trim();
+    if (!creatorId) return res.status(400).json({ error: 'creatorId required' });
+
+    const assets = await getAssetsForViewer(req, creatorId);
+    const path = assets?.portrait_path;
+    if (!path) return res.status(404).json({ error: 'No portrait uploaded yet' });
+
+    const owned = await getOwnedCreator(req);
+    const storageClient = owned?.id === creatorId ? req.supabase : (req.admin || req.supabase);
+    if (!storageClient) return res.status(503).json({ error: 'Storage unavailable' });
+
+    let file = null;
+    let dlError = null;
+    ({ data: file, error: dlError } = await storageClient.storage.from(BUCKET).download(path));
+    if ((dlError || !file) && req.admin && storageClient !== req.admin) {
+      ({ data: file, error: dlError } = await req.admin.storage.from(BUCKET).download(path));
+    }
+    if (dlError || !file) {
+      return res.status(404).json({ error: 'Could not load portrait' });
+    }
+
+    const ext = (path.split('.').pop() || 'jpg').toLowerCase();
+    const type = ext === 'png' ? 'image/png' : ext === 'webp' ? 'image/webp' : ext === 'gif' ? 'image/gif' : 'image/jpeg';
+    res.setHeader('Content-Type', type);
+    res.setHeader('Cache-Control', 'private, max-age=300');
+    res.send(Buffer.from(await file.arrayBuffer()));
+  } catch (e) {
+    const status = e.status || 500;
+    res.status(status).json({ error: e.message });
+  }
+});
+
 /* GET /api/avatar/assets — asset record + signed URLs for media.
    ?creatorId= loads a legacy the viewer can access (defaults to the viewer's own legacy).
    ?light=1 skips signed URLs (faster for home screens that only need liveReady). */
@@ -360,6 +400,7 @@ router.get('/assets', async (req, res) => {
       voiceCloned: assets?.metadata?.cloned === true,
       avatarReady: avatarReady(assets),
       liveReady: anamReady(assets),
+      hasPortrait: Boolean(assets?.portrait_path),
       previewUrl: assets?.metadata?.heygen_avatar_preview_url || null,
       urls,
     });
