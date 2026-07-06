@@ -196,10 +196,20 @@ export async function previewInvite(req, res) {
 
     const invitation = await lookupInvitationByToken(supabase, admin, req.params.token);
     if (!invitation) return res.status(404).json({ error: 'Invitation not found' });
-    if (invitation.status !== 'pending') return res.status(409).json({ error: 'Invitation is no longer valid' });
     if (new Date(invitation.expires_at) < new Date()) return res.status(410).json({ error: 'Invitation has expired' });
+    if (invitation.status === 'accepted') {
+      return res.json({
+        role: invitation.role,
+        creatorId: invitation.creator_id,
+        creatorDisplayName: invitation.creator_display_name,
+        expiresAt: invitation.expires_at,
+        alreadyAccepted: true,
+      });
+    }
+    if (invitation.status !== 'pending') return res.status(409).json({ error: 'Invitation is no longer valid' });
     res.json({
       role: invitation.role,
+      creatorId: invitation.creator_id,
       creatorDisplayName: invitation.creator_display_name,
       expiresAt: invitation.expires_at,
     });

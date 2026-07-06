@@ -64,3 +64,16 @@ export function can(role, action) {
 export function permissionsFor(role) {
   return { ...(PERMISSIONS[role] || PERMISSIONS.member) };
 }
+
+const ROLE_RANK = {
+  [ROLES.CREATOR]: 3,
+  [ROLES.ADMIN]: 2,
+  [ROLES.MEMBER]: 1,
+};
+
+/** Keep the higher-privilege role when re-accepting a different invite for the same legacy. */
+export function higherRole(existing, incoming) {
+  const a = ROLE_RANK[existing] || 0;
+  const b = ROLE_RANK[incoming] || 0;
+  return a >= b ? existing : incoming;
+}

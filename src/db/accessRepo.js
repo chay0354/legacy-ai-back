@@ -1,5 +1,5 @@
 import { getPool } from './pool.js';
-import { ROLES } from '../services/access.js';
+import { ROLES, higherRole } from '../services/access.js';
 
 /**
  * Access store: memberships + invitations. Two backends:
@@ -146,7 +146,11 @@ function pgStore() {
         await client.query(
           `INSERT INTO legacy_members (creator_id, user_id, role, invited_by)
            VALUES ($1, $2, $3, $4)
-           ON CONFLICT (creator_id, user_id) DO UPDATE SET role = EXCLUDED.role`,
+           ON CONFLICT (creator_id, user_id) DO UPDATE SET role = CASE
+             WHEN legacy_role_rank(legacy_members.role) >= legacy_role_rank(EXCLUDED.role)
+               THEN legacy_members.role
+             ELSE EXCLUDED.role
+           END`,
           [invitation.creator_id, userId, invitation.role, invitation.invited_by]
         );
         await client.query(
@@ -222,13 +226,23 @@ function supabaseStore(supabase, admin) {
     },
 
     async getMembership(creatorId, userId) {
-      const { data } = await writer
+      const { data } = await supabase
         .from('legacy_members')
         .select('*')
         .eq('creator_id', creatorId)
         .eq('user_id', userId)
         .maybeSingle();
-      return data || null;
+      if (data) return data;
+      if (admin) {
+        const { data: adminRow } = await admin
+          .from('legacy_members')
+          .select('*')
+          .eq('creator_id', creatorId)
+          .eq('user_id', userId)
+          .maybeSingle();
+        return adminRow || null;
+      }
+      return null;
     },
 
     async listMembershipsForUser(userId) {
@@ -337,13 +351,20 @@ function supabaseStore(supabase, admin) {
             'Joining needs a database function. Run supabase/migrations/20250621160000_accept_invitation_rpc.sql in the Supabase SQL Editor (or set SUPABASE_SECRET_KEY / DATABASE_URL on the server).'
           );
         }
+        const existing = await writer
+          .from('legacy_members')
+          .select('role')
+          .eq('creator_id', invitation.creator_id)
+          .eq('user_id', userId)
+          .maybeSingle();
+        const role = higherRole(existing.data?.role, invitation.role);
         const { error: insErr } = await writer
           .from('legacy_members')
           .upsert(
             {
               creator_id: invitation.creator_id,
               user_id: userId,
-              role: invitation.role,
+              role,
               invited_by: invitation.invited_by,
             },
             { onConflict: 'creator_id,user_id' }

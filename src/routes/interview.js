@@ -54,6 +54,32 @@ function displayName(user) {
     'Friend';
 }
 
+function accessStore(req) {
+  return makeAccessStore({ supabase: req.supabase, admin: req.admin });
+}
+
+/** Family members/admins must never start the creator interview flow. */
+async function assertInterviewCreator(req) {
+  const memberships = await accessStore(req).listMembershipsForUser(req.user.id);
+  const shared = memberships.filter((m) => !m.is_owner);
+  if (shared.length > 0) {
+    const err = new Error('The interview is only for people preserving their own legacy.');
+    err.status = 403;
+    err.code = 'FAMILY_VIEWER';
+    throw err;
+  }
+  return memberships;
+}
+
+/** When no creatorId is passed, family viewers land on a shared legacy — not a new empty one. */
+async function defaultCreatorIdForProfile(req, requestedCreatorId) {
+  if (requestedCreatorId) return requestedCreatorId;
+  const memberships = await accessStore(req).listMembershipsForUser(req.user.id);
+  const shared = memberships.filter((m) => !m.is_owner);
+  if (shared.length > 0) return shared[0].creator_id;
+  return null;
+}
+
 async function getOrCreateCreatorSupabase(supabase, user) {
   const name = displayName(user);
 
@@ -189,6 +215,7 @@ async function loadSessionMeta(supabase, pgMode, sessionId) {
 /** GET /api/interview/session[?stage=foundation|enriched|legacy] */
 router.get('/session', async (req, res) => {
   try {
+    await assertInterviewCreator(req);
     const usePg = !!getPool();
     const requestedStage = req.query.stage || null;
 
@@ -416,8 +443,8 @@ router.post('/session/:sessionId/complete', async (req, res) => {
  */
 router.get('/profile', async (req, res) => {
   try {
-    const store = makeAccessStore({ supabase: req.supabase, admin: req.admin });
-    const requestedCreatorId = req.query.creatorId || null;
+    const store = accessStore(req);
+    const requestedCreatorId = await defaultCreatorIdForProfile(req, req.query.creatorId || null);
 
     if (getPool()) {
       let creatorId = requestedCreatorId;
@@ -427,6 +454,7 @@ router.get('/profile', async (req, res) => {
         if (!membership) return res.status(403).json({ error: 'You do not have access to this legacy' });
         role = membership.role;
       } else {
+        await assertInterviewCreator(req);
         const creator = await getOrCreateCreatorPg(req.user.id, displayName(req.user));
         await ensureOwnerMembership(req, creator.id);
         creatorId = creator.id;
@@ -456,6 +484,7 @@ router.get('/profile', async (req, res) => {
       const { data } = await req.supabase.from('legacy_creators').select('*').eq('id', requestedCreatorId).maybeSingle();
       creatorRow = data;
     } else {
+      await assertInterviewCreator(req);
       creatorRow = await getOrCreateCreatorSupabase(req.supabase, req.user);
       await ensureOwnerMembership(req, creatorRow.id);
       role = 'creator';
