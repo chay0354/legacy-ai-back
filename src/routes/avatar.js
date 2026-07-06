@@ -74,6 +74,31 @@ async function signed(req, path) {
   return data.signedUrl;
 }
 
+/** Signed URL for a creator's media — uses admin storage for family/admin viewers. */
+async function viewerCanAccessCreator(req, creatorId) {
+  const owned = await getOwnedCreator(req);
+  if (owned?.id === creatorId) return true;
+  const store = makeAccessStore({ supabase: req.supabase, admin: req.admin });
+  const membership = await store.getMembership(creatorId, req.user.id);
+  return Boolean(membership);
+}
+
+async function signedForCreator(req, creatorId, path) {
+  if (!path || !creatorId) return null;
+  const owned = await getOwnedCreator(req);
+  let client = req.supabase;
+  if (owned?.id !== creatorId) {
+    if (!(await viewerCanAccessCreator(req, creatorId))) return null;
+    client = req.admin;
+  }
+  const { data, error } = await client.storage.from(BUCKET).createSignedUrl(path, 60 * 60);
+  if (error) {
+    console.warn('[avatar] signed URL failed:', path, error.message);
+    return null;
+  }
+  return data.signedUrl;
+}
+
 async function upsertAssets(req, creatorId, patch) {
   const { data, error } = await req.supabase
     .from('legacy_avatar_assets')
@@ -322,10 +347,10 @@ router.get('/assets', async (req, res) => {
     let urls = {};
     if (assets && !light) {
       urls = {
-        portrait: await signed(req, assets.portrait_path),
-        idle: await signed(req, assets.idle_video_path),
-        speaking: await signed(req, assets.speaking_video_path),
-        voiceSample: await signed(req, assets.voice_sample_path),
+        portrait: await signedForCreator(req, creatorId, assets.portrait_path),
+        idle: await signedForCreator(req, creatorId, assets.idle_video_path),
+        speaking: await signedForCreator(req, creatorId, assets.speaking_video_path),
+        voiceSample: await signedForCreator(req, creatorId, assets.voice_sample_path),
       };
     }
     res.json({
@@ -335,6 +360,7 @@ router.get('/assets', async (req, res) => {
       voiceCloned: assets?.metadata?.cloned === true,
       avatarReady: avatarReady(assets),
       liveReady: anamReady(assets),
+      previewUrl: assets?.metadata?.heygen_avatar_preview_url || null,
       urls,
     });
   } catch (e) {
@@ -608,12 +634,15 @@ router.post('/voice/test', async (req, res) => {
 
 /* ----------------------------- conversation ------------------------------ */
 
-/** Resolve the creator to talk to: an explicit creatorId (RLS-guarded) or the user's own. */
+/** Resolve the creator to talk to: an explicit creatorId (membership-guarded) or the user's own. */
 async function resolveTalkCreatorId(req) {
   const requested = (req.body?.creatorId || req.query?.creatorId || '').trim();
-  if (requested) return requested;
   const owned = await getOwnedCreator(req);
-  return owned?.id || null;
+  if (!requested) return owned?.id || null;
+  if (!(await viewerCanAccessCreator(req, requested))) {
+    throw Object.assign(new Error('You do not have access to this legacy'), { status: 403 });
+  }
+  return requested;
 }
 
 /** Pull the legacy's preserved content (RLS-scoped) to ground the avatar's answers. */
@@ -738,7 +767,7 @@ router.post('/live/start', async (req, res) => {
 
     // The creator's own Anam face + voice. Provision on demand if the owner is calling;
     // viewers rely on the owner having provisioned already.
-    let assets = await getAssets(req, creatorId);
+    let assets = await getAssetsForViewer(req, creatorId);
     let usingOwnFace = anamReady(assets);
     if (!usingOwnFace) {
       const owned = await getOwnedCreator(req);
