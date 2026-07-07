@@ -39,3 +39,6 @@ export function heyGenVoiceSettings() {
 
 export const VOICE_TEST_PHRASE =
   'Hello. Pull up a chair — ask me anything you like, and I will answer the way I always would have.';
+
+export const AVATAR_GREETING =
+  'Hello. It really is me — you can talk to me here, and I will answer the way I always would have.';

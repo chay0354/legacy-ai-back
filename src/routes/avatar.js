@@ -1,16 +1,6 @@
 import { Router } from 'express';
 import { cloneVoice as elevenLabsClone, textToSpeech as elevenLabsTts, deleteVoice as elevenLabsDeleteVoice, isInstantCloneLikelyAvailable, markInstantCloneUnavailable } from '../services/elevenlabs.js';
-import {
-  startTalkingVideo,
-  startAvatarVideo,
-  getVideoStatus,
-  uploadAsset,
-  cloneVoiceFromSample,
-  createPhotoAvatar,
-  generateSpeech as heygenTts,
-  AVATAR_GREETING,
-} from '../services/heygen.js';
-import { heyGenVoiceSettings, VOICE_TEST_PHRASE } from '../config/voice.js';
+import { AVATAR_GREETING, VOICE_TEST_PHRASE } from '../config/voice.js';
 import { callClaude } from '../services/anthropic.js';
 import {
   isConfigured as anamConfigured,
@@ -124,89 +114,9 @@ function voiceReady(assets) {
   );
 }
 
-/** True when the HeyGen photo avatar is registered for this creator. */
+/** True when portrait + cloned voice are ready (studio complete, live call can be provisioned). */
 function avatarReady(assets) {
-  return assets?.metadata?.avatar_status === 'ready'
-    && Boolean(assets.metadata?.heygen_photo_avatar_id);
-}
-
-/**
- * Upload the creator's portrait to HeyGen and register a Photo Avatar (their face).
- * Idempotent — skips if already provisioned for the same portrait path.
- */
-async function provisionCreatorAvatar(req, creator) {
-  if (!process.env.HEYGEN_API_KEY) {
-    throw new Error('Avatar provisioning requires HEYGEN_API_KEY.');
-  }
-
-  const assets = await getAssets(req, creator.id);
-  if (!assets?.portrait_path) {
-    throw new Error('Add a portrait photo in the Avatar Studio first.');
-  }
-  if (!voiceReady(assets)) {
-    throw new Error('Record your voice in the Avatar Studio first.');
-  }
-
-  const portraitKey = assets.portrait_path;
-  const meta = assets.metadata || {};
-  if (
-    meta.avatar_status === 'ready'
-    && meta.heygen_photo_avatar_id
-    && meta.avatar_portrait_path === portraitKey
-  ) {
-    return assets;
-  }
-
-  await upsertAssets(req, creator.id, {
-    metadata: {
-      ...meta,
-      avatar_status: 'processing',
-      avatar_error: null,
-    },
-  });
-
-  const { data: file, error: dlError } = await req.supabase.storage.from(BUCKET).download(portraitKey);
-  if (dlError || !file) {
-    await upsertAssets(req, creator.id, {
-      metadata: { ...meta, avatar_status: 'failed', avatar_error: 'Could not read portrait photo.' },
-    });
-    throw new Error(`Could not read portrait photo: ${dlError?.message || 'not found'}`);
-  }
-
-  const buffer = Buffer.from(await file.arrayBuffer());
-  const ext = (portraitKey.split('.').pop() || 'jpg').toLowerCase();
-  const contentType = ext === 'png' ? 'image/png' : 'image/jpeg';
-
-  let avatarId;
-  let groupId;
-  let previewUrl;
-  try {
-    ({ avatarId, groupId, previewUrl } = await createPhotoAvatar({
-      name: `Legacy — ${creator.display_name || 'Creator'} (${creator.id.slice(0, 8)})`,
-      buffer,
-      contentType,
-      filename: `portrait.${ext === 'png' ? 'png' : 'jpg'}`,
-    }));
-  } catch (e) {
-    console.error('[avatar/provision] HeyGen photo avatar failed:', e);
-    await upsertAssets(req, creator.id, {
-      metadata: { ...meta, avatar_status: 'failed', avatar_error: e.message },
-    });
-    throw e;
-  }
-
-  return upsertAssets(req, creator.id, {
-    metadata: {
-      ...meta,
-      avatar_status: 'ready',
-      avatar_error: null,
-      avatar_portrait_path: portraitKey,
-      heygen_photo_avatar_id: avatarId,
-      heygen_avatar_group_id: groupId,
-      heygen_avatar_preview_url: previewUrl,
-      avatar_provisioned_at: new Date().toISOString(),
-    },
-  });
+  return Boolean(assets?.portrait_path && voiceReady(assets));
 }
 
 /** True when the Anam live avatar (face) + voice are provisioned for this creator. */
@@ -333,9 +243,6 @@ function buildProvisionResponse(assets, extra = {}) {
     status: anamReady(assets) ? 'ready' : (assets?.metadata?.anam_status || 'none'),
     avatarReady: avatarReady(assets),
     liveReady: anamReady(assets),
-    heygenPhotoAvatarId: assets?.metadata?.heygen_photo_avatar_id || null,
-    anamAvatarId: assets?.metadata?.anam_avatar_id || null,
-    previewUrl: assets?.metadata?.heygen_avatar_preview_url || null,
     assets,
     ...extra,
   };
@@ -354,17 +261,12 @@ function clearedAnamMetadata(meta = {}) {
   };
 }
 
-/** Run Anam + HeyGen provisioning after the HTTP response (Vercel waitUntil). */
+/** Run Anam live-avatar provisioning after the HTTP response (Vercel waitUntil). */
 async function runBackgroundProvision(req, creator) {
   const ctx = { supabase: req.supabase, admin: req.admin, user: req.user };
   try {
     if (anamConfigured()) {
       await provisionAnam(ctx, creator);
-    }
-    try {
-      await provisionCreatorAvatar(ctx, creator);
-    } catch (e) {
-      console.warn('[avatar/provision/bg] HeyGen:', e.message);
     }
   } catch (e) {
     console.error('[avatar/provision/bg] failed:', e);
@@ -446,7 +348,7 @@ router.get('/assets', async (req, res) => {
       avatarReady: avatarReady(assets),
       liveReady: anamReady(assets),
       hasPortrait: Boolean(assets?.portrait_path),
-      previewUrl: assets?.metadata?.heygen_avatar_preview_url || null,
+      previewUrl: urls.portrait || null,
       urls,
     });
   } catch (e) {
@@ -457,7 +359,7 @@ router.get('/assets', async (req, res) => {
 
 function hasClonedVoice(assets) {
   if (!assets || assets.voice_status !== 'ready') return false;
-  return Boolean(assets.voice_id || resolveElevenLabsVoiceId(assets) || assets.metadata?.heygen_voice_id);
+  return Boolean(assets.voice_id || resolveElevenLabsVoiceId(assets));
 }
 
 function resolveElevenLabsVoiceId(assets) {
@@ -491,97 +393,42 @@ async function gatherVoiceSamples(req, creatorId, primaryPath, primaryBuffer, pr
 }
 
 async function cloneCreatorVoice({ req, creator, voiceSamplePath, buffer, file }) {
+  if (!process.env.ELEVENLABS_API_KEY) {
+    throw new Error('Voice cloning requires ELEVENLABS_API_KEY.');
+  }
+
   const voiceName = `Legacy — ${creator.display_name || 'Creator'} (${creator.id.slice(0, 8)})`;
   const samples = await gatherVoiceSamples(req, creator.id, voiceSamplePath, buffer, file);
 
-  if (await isInstantCloneLikelyAvailable()) {
-    try {
-      const elVoiceId = await elevenLabsClone({
-        name: voiceName,
-        samples,
-        description: 'Legacy AI creator voice clone',
-      });
-      return {
-        voiceId: elVoiceId,
-        provider: 'elevenlabs',
-        elevenlabsVoiceId: elVoiceId,
-        heygenVoiceId: null,
-      };
-    } catch (e) {
-      markInstantCloneUnavailable(e);
-      console.warn('[avatar/voice] ElevenLabs clone unavailable, using HeyGen:', e.message);
-    }
+  if (!await isInstantCloneLikelyAvailable()) {
+    throw new Error('ElevenLabs instant voice cloning is not available on this plan.');
   }
 
-  if (!process.env.HEYGEN_API_KEY) {
-    throw new Error('Voice cloning requires ELEVENLABS_API_KEY or HEYGEN_API_KEY.');
+  try {
+    const elVoiceId = await elevenLabsClone({
+      name: voiceName,
+      samples,
+      description: 'Legacy AI creator voice clone',
+    });
+    return {
+      voiceId: elVoiceId,
+      provider: 'elevenlabs',
+      elevenlabsVoiceId: elVoiceId,
+    };
+  } catch (e) {
+    markInstantCloneUnavailable(e);
+    throw new Error(`Voice cloning failed: ${e.message}`);
   }
-
-  const heygenVoiceId = await cloneVoiceFromSample({
-    voiceName,
-    buffer,
-    mimeType: file.type || 'audio/wav',
-    filename: voiceSamplePath,
-  });
-
-  return {
-    voiceId: heygenVoiceId,
-    provider: 'heygen',
-    elevenlabsVoiceId: null,
-    heygenVoiceId,
-  };
 }
 
 async function synthesizeSpeech(assets, text) {
   const elVoiceId = resolveElevenLabsVoiceId(assets);
-  const heygenVoiceId = assets.voice_provider === 'heygen' ? assets.voice_id : assets.metadata?.heygen_voice_id;
-
-  if (elVoiceId && process.env.ELEVENLABS_API_KEY) {
-    try {
-      const buffer = await elevenLabsTts({ voiceId: elVoiceId, text });
-      return { buffer, provider: 'elevenlabs', voiceId: heygenVoiceId || assets.voice_id, text };
-    } catch (e) {
-      console.warn('[avatar/tts] ElevenLabs TTS failed, trying HeyGen:', e.message);
-    }
+  if (!elVoiceId || !process.env.ELEVENLABS_API_KEY) {
+    throw new Error('No cloned voice available for this legacy.');
   }
 
-  if (heygenVoiceId) {
-    try {
-      const { audioUrl, buffer } = await heygenTts({ voiceId: heygenVoiceId, text });
-      return {
-        url: audioUrl,
-        buffer: buffer || undefined,
-        voiceId: heygenVoiceId,
-        text,
-        provider: 'heygen',
-      };
-    } catch (e) {
-      if (!isHeyGenCreditsError(e)) throw e;
-      if (elVoiceId && process.env.ELEVENLABS_API_KEY) {
-        console.warn('[avatar/tts] HeyGen credits exhausted — using ElevenLabs voice');
-        const buffer = await elevenLabsTts({ voiceId: elVoiceId, text });
-        return { buffer, provider: 'elevenlabs', text };
-      }
-      throw heygenCreditsExhaustedError(assets);
-    }
-  }
-
-  throw new Error('No cloned voice available for this legacy.');
-}
-
-function isHeyGenCreditsError(err) {
-  return /insufficient api credits/i.test(err?.message || '');
-}
-
-function heygenCreditsExhaustedError(assets) {
-  const liveReady = Boolean(assets?.metadata?.anam_avatar_id && assets?.metadata?.anam_voice_id);
-  const msg = liveReady
-    ? 'Pre-recorded talking video is unavailable right now. Your cloned face and voice still work on Live Call.'
-    : 'Pre-recorded talking video is unavailable right now. Finish Avatar Studio setup to enable Live Call.';
-  const err = new Error(msg);
-  err.code = 'heygen_credits_exhausted';
-  err.liveCallAvailable = liveReady;
-  return err;
+  const buffer = await elevenLabsTts({ voiceId: elVoiceId, text });
+  return { buffer, provider: 'elevenlabs', voiceId: elVoiceId, text };
 }
 
 /* POST /api/avatar/voice-sample { voiceSamplePath } — save a voice recording for playback on the avatar page (no cloning). */
@@ -608,7 +455,7 @@ router.post('/voice-sample', async (req, res) => {
   }
 });
 
-/* POST /api/avatar/voice { voiceSamplePath } — clone the creator's voice (ElevenLabs first, HeyGen fallback). */
+/* POST /api/avatar/voice { voiceSamplePath } — clone the creator's voice via ElevenLabs. */
 router.post('/voice', async (req, res) => {
   try {
     const { voiceSamplePath } = req.body || {};
@@ -617,8 +464,8 @@ router.post('/voice', async (req, res) => {
     const creator = await getOwnedCreator(req);
     if (!creator) return res.status(404).json({ error: 'No legacy to attach a voice to' });
 
-    if (!process.env.ELEVENLABS_API_KEY && !process.env.HEYGEN_API_KEY) {
-      return res.status(503).json({ error: 'Voice cloning requires ELEVENLABS_API_KEY or HEYGEN_API_KEY.' });
+    if (!process.env.ELEVENLABS_API_KEY) {
+      return res.status(503).json({ error: 'Voice cloning requires ELEVENLABS_API_KEY.' });
     }
 
     await upsertAssets(req, creator.id, { voice_sample_path: voiceSamplePath, voice_status: 'processing' });
@@ -655,18 +502,8 @@ router.post('/voice', async (req, res) => {
         cloned: true,
         voice_provider: cloned.provider,
         elevenlabs_voice_id: cloned.elevenlabsVoiceId,
-        heygen_voice_id: cloned.heygenVoiceId || existing?.metadata?.heygen_voice_id || null,
       },
     });
-
-    let provisioned = null;
-    if (saved.portrait_path) {
-      try {
-        provisioned = await provisionCreatorAvatar(req, creator);
-      } catch (e) {
-        console.warn('[avatar/voice] auto-provision deferred:', e.message);
-      }
-    }
 
     res.json({
       success: true,
@@ -674,8 +511,8 @@ router.post('/voice', async (req, res) => {
       voiceProvider: cloned.provider,
       cloned: true,
       message: 'Your voice is cloned and ready for your live avatar.',
-      assets: provisioned || saved,
-      avatarReady: avatarReady(provisioned || saved),
+      assets: saved,
+      avatarReady: avatarReady(saved),
     });
   } catch (e) {
     res.status(500).json({ error: e.message });
@@ -700,7 +537,7 @@ router.post('/voice/test', async (req, res) => {
       return res.status(502).json({ error: 'Could not synthesize test audio.' });
     }
 
-    const ext = synth.provider === 'elevenlabs' ? 'mp3' : 'wav';
+    const ext = 'mp3';
     const audioPath = `${creator.id}/voice-test-${Date.now()}.${ext}`;
     const { error: upErr } = await req.supabase.storage.from(BUCKET).upload(audioPath, synth.buffer, {
       contentType: ext === 'wav' ? 'audio/wav' : 'audio/mpeg',
@@ -899,19 +736,17 @@ router.post('/live/start', async (req, res) => {
   }
 });
 
-/* POST /api/avatar/say { text, creatorId? } — render the avatar speaking `text` (HeyGen + cloned voice).
-   Returns a videoId to poll. Requires the creator's own portrait + voice. */
+/* POST /api/avatar/say { text, creatorId? } — synthesize speech in the cloned voice (audio only). */
 router.post('/say', async (req, res) => {
   try {
     const text = (req.body?.text || '').trim();
     if (!text) return res.status(400).json({ error: 'text required' });
-    if (!process.env.HEYGEN_API_KEY) {
-      return res.status(503).json({ error: 'Talking video is not configured (missing HEYGEN_API_KEY).' });
+    if (!process.env.ELEVENLABS_API_KEY) {
+      return res.status(503).json({ error: 'Voice playback requires ELEVENLABS_API_KEY.' });
     }
 
-    // Talking video uses the creator's own portrait + voice (RLS allows owner only).
     const creator = await getOwnedCreator(req);
-    if (!creator) return res.status(403).json({ error: 'Only the legacy owner can render the talking avatar.' });
+    if (!creator) return res.status(403).json({ error: 'Only the legacy owner can synthesize speech.' });
 
     const assets = await getAssets(req, creator.id);
     if (!assets?.portrait_path) return res.status(409).json({ error: 'Add a portrait photo in the Avatar Studio first.' });
@@ -925,159 +760,33 @@ router.post('/say', async (req, res) => {
       });
     }
 
-    const portraitUrl = await signed(req, assets.portrait_path);
-    if (!portraitUrl) return res.status(409).json({ error: 'Could not read the portrait photo.' });
+    const synth = await synthesizeSpeech(assets, text.slice(0, 1500));
+    const { buffer } = synth;
+    if (!buffer) throw new Error('Could not synthesize speech');
 
-    // Ensure HeyGen photo avatar exists (face registered from the user's portrait).
-    let activeAssets = assets;
-    if (!avatarReady(assets)) {
-      try {
-        activeAssets = await provisionCreatorAvatar(req, creator);
-      } catch (e) {
-        console.warn('[avatar/say] provision failed, falling back to image render:', e.message);
-      }
-    }
-
-    const synth = await synthesizeSpeech(activeAssets, text.slice(0, 1500));
-    const { url: ttsUrl, buffer, voiceId, text: speechText, provider } = synth;
-
-    let playbackUrl = null;
-    let videoId;
-    const photoAvatarId = activeAssets.metadata?.heygen_photo_avatar_id;
-    const audioOnlyNotice =
-      'Pre-recorded talking video is unavailable right now. Your cloned voice still plays as audio — use Live Call for real-time face and voice.';
-
-    if (buffer) {
-      const ext = provider === 'elevenlabs' ? 'mp3' : ttsUrl?.includes('.wav') ? 'wav' : 'mp3';
-      const contentType = ext === 'wav' ? 'audio/wav' : 'audio/mpeg';
-      const audioPath = `${creator.id}/tts-${Date.now()}.${ext}`;
-      const { error: upErr } = await req.supabase.storage.from(BUCKET).upload(audioPath, buffer, {
-        contentType, upsert: true,
-      });
-      if (upErr) throw new Error(`Could not store voice audio: ${upErr.message}`);
-      playbackUrl = await signed(req, audioPath);
-
-      try {
-        const audioAssetId = await uploadAsset(buffer, { filename: `legacy-speech.${ext}`, contentType });
-        if (photoAvatarId) {
-          videoId = await startAvatarVideo({
-            avatarId: photoAvatarId,
-            audioAssetId,
-            script: speechText || text.slice(0, 1500),
-            voiceId,
-          });
-        } else {
-          videoId = await startTalkingVideo({ imageUrl: portraitUrl, audioAssetId });
-        }
-      } catch (e) {
-        if (!isHeyGenCreditsError(e)) throw e;
-        console.warn('[avatar/say] HeyGen video skipped — credits exhausted');
-        return res.json({
-          videoId: null,
-          audioUrl: playbackUrl,
-          audioOnly: true,
-          notice: audioOnlyNotice,
-          voiceCloned: true,
-          avatarReady: avatarReady(activeAssets),
-        });
-      }
-    } else if (ttsUrl) {
-      try {
-        if (photoAvatarId) {
-          videoId = await startAvatarVideo({
-            avatarId: photoAvatarId,
-            script: speechText || text.slice(0, 1500),
-            voiceId,
-            voiceSettings: heyGenVoiceSettings(),
-          });
-        } else {
-          videoId = await startTalkingVideo({
-            imageUrl: portraitUrl,
-            script: speechText || text.slice(0, 1500),
-            voiceId,
-            voiceSettings: heyGenVoiceSettings(),
-          });
-        }
-      } catch (e) {
-        if (!isHeyGenCreditsError(e)) throw e;
-        return res.json({
-          videoId: null,
-          audioUrl: null,
-          audioOnly: true,
-          notice: audioOnlyNotice,
-          voiceCloned: true,
-          avatarReady: avatarReady(activeAssets),
-        });
-      }
-    } else {
-      throw new Error('Could not synthesize speech');
-    }
-
-    res.json({ videoId, audioUrl: playbackUrl, voiceCloned: true, avatarReady: avatarReady(activeAssets) });
-  } catch (e) {
-    if (e.code === 'heygen_credits_exhausted') {
-      console.info('[avatar/say] HeyGen unavailable — Live Call is ready');
-    } else {
-      console.error('[avatar/say] failed:', e);
-    }
-    const status = e.code === 'heygen_credits_exhausted' ? 402 : 502;
-    res.status(status).json({
-      error: e.message,
-      code: e.code || 'say_failed',
-      liveCallAvailable: Boolean(e.liveCallAvailable),
+    const audioPath = `${creator.id}/tts-${Date.now()}.mp3`;
+    const { error: upErr } = await req.supabase.storage.from(BUCKET).upload(audioPath, buffer, {
+      contentType: 'audio/mpeg',
+      upsert: true,
     });
-  }
-});
+    if (upErr) throw new Error(`Could not store voice audio: ${upErr.message}`);
+    const playbackUrl = await signed(req, audioPath);
 
-/* GET /api/avatar/video/:videoId/stream — proxy HeyGen MP4 (CDN often blocks direct browser loads). */
-router.get('/video/:videoId/stream', async (req, res) => {
-  try {
-    if (!process.env.HEYGEN_API_KEY) {
-      return res.status(503).json({ error: 'Talking video is not configured (missing HEYGEN_API_KEY).' });
-    }
-    const status = await getVideoStatus(req.params.videoId);
-    if (status.status !== 'completed' || !status.url) {
-      const code = status.status === 'failed' ? 502 : 425;
-      return res.status(code).json({
-        error: status.error || 'Video not ready yet',
-        status: status.status,
-      });
-    }
-
-    const upstreamHeaders = {};
-    if (req.headers.range) upstreamHeaders.Range = req.headers.range;
-
-    const upstream = await fetch(status.url, { headers: upstreamHeaders });
-    if (!upstream.ok && upstream.status !== 206) {
-      return res.status(502).json({ error: `Could not load video from HeyGen (${upstream.status})` });
-    }
-
-    res.status(upstream.status);
-    for (const name of ['content-type', 'content-length', 'content-range', 'accept-ranges']) {
-      const val = upstream.headers.get(name);
-      if (val) res.setHeader(name, val);
-    }
-    if (!res.getHeader('content-type')) res.setHeader('Content-Type', 'video/mp4');
-    res.setHeader('Cache-Control', 'private, max-age=3600');
-
-    res.send(Buffer.from(await upstream.arrayBuffer()));
+    const liveReady = anamReady(assets);
+    res.json({
+      videoId: null,
+      audioUrl: playbackUrl,
+      audioOnly: true,
+      notice: liveReady
+        ? 'Playing in your voice. Use Live Call for real-time face and voice.'
+        : 'Playing in your voice. Finish Avatar Studio to enable Live Call.',
+      voiceCloned: true,
+      avatarReady: avatarReady(assets),
+      liveReady,
+    });
   } catch (e) {
-    console.error('[avatar/video/stream] failed:', e);
-    res.status(502).json({ error: e.message });
-  }
-});
-
-/* GET /api/avatar/video/:videoId — poll a HeyGen render. */
-router.get('/video/:videoId', async (req, res) => {
-  try {
-    if (!process.env.HEYGEN_API_KEY) {
-      return res.status(503).json({ error: 'Talking video is not configured (missing HEYGEN_API_KEY).' });
-    }
-    const status = await getVideoStatus(req.params.videoId);
-    res.json(status);
-  } catch (e) {
-    console.error('[avatar/video] failed:', e);
-    res.status(502).json({ error: e.message });
+    console.error('[avatar/say] failed:', e);
+    res.status(502).json({ error: e.message, code: 'say_failed' });
   }
 });
 
@@ -1129,8 +838,7 @@ router.delete('/live', async (req, res) => {
   }
 });
 
-/* POST /api/avatar/provision — set up the creator's avatar from their photo + voice:
-   Anam live avatar + cloned voice (real-time call) and HeyGen photo avatar (talking video).
+/* POST /api/avatar/provision — set up the Anam live avatar from photo + voice.
    On Vercel, Anam runs in the background — client polls GET /assets until liveReady. */
 router.post('/provision', async (req, res) => {
   try {
@@ -1199,7 +907,7 @@ router.put('/assets', async (req, res) => {
     const patch = {};
     if (portraitPath !== undefined) {
       patch.portrait_path = portraitPath;
-      // New photo — re-provision the HeyGen face avatar on next provision call.
+      // New photo — clear Anam so the next provision rebuilds the live face.
       if (portraitPath !== existing?.portrait_path) {
         const oldAnamId = existing?.metadata?.anam_avatar_id;
         if (oldAnamId && anamConfigured()) {
@@ -1209,9 +917,6 @@ router.put('/assets', async (req, res) => {
         }
         patch.metadata = {
           ...(existing?.metadata || {}),
-          avatar_status: 'none',
-          heygen_photo_avatar_id: null,
-          avatar_portrait_path: null,
           anam_status: 'none',
           anam_avatar_id: null,
           anam_avatar_portrait_path: null,
@@ -1222,16 +927,7 @@ router.put('/assets', async (req, res) => {
     if (speakingVideoPath !== undefined) patch.speaking_video_path = speakingVideoPath;
     if (Object.keys(patch).length === 0) return res.status(400).json({ error: 'Nothing to update' });
 
-    let saved = await upsertAssets(req, creator.id, patch);
-
-    // Photo + voice both ready — register HeyGen photo avatar automatically.
-    if (portraitPath !== undefined && voiceReady(saved)) {
-      try {
-        saved = await provisionCreatorAvatar(req, creator);
-      } catch (e) {
-        console.warn('[avatar/assets] auto-provision deferred:', e.message);
-      }
-    }
+    const saved = await upsertAssets(req, creator.id, patch);
 
     res.json({
       success: true,
@@ -1264,26 +960,16 @@ router.post('/speak', async (req, res) => {
     const assets = await getAssets(req, targetCreatorId);
     if (!hasClonedVoice(assets)) return res.status(409).json({ error: 'No cloned voice yet for this legacy' });
 
-    const { url, buffer } = await synthesizeSpeech(assets, text.slice(0, 5000));
+    const { buffer } = await synthesizeSpeech(assets, text.slice(0, 5000));
     if (buffer) {
-      const isWav = url?.includes('.wav');
-      res.setHeader('Content-Type', isWav ? 'audio/wav' : 'audio/mpeg');
+      res.setHeader('Content-Type', 'audio/mpeg');
       res.setHeader('Cache-Control', 'no-store');
       return res.send(buffer);
     }
-    return res.status(502).json({ error: 'Could not download voice audio. Is the backend running and reachable?' });
+    return res.status(502).json({ error: 'Could not synthesize voice audio.' });
   } catch (e) {
-    if (e.code === 'heygen_credits_exhausted') {
-      console.info('[avatar/speak] HeyGen unavailable — Live Call is ready');
-    } else {
-      console.error('[avatar/speak] failed:', e);
-    }
-    const status = e.code === 'heygen_credits_exhausted' ? 402 : 500;
-    res.status(status).json({
-      error: e.message,
-      code: e.code || 'speak_failed',
-      liveCallAvailable: Boolean(e.liveCallAvailable),
-    });
+    console.error('[avatar/speak] failed:', e);
+    res.status(500).json({ error: e.message, code: 'speak_failed' });
   }
 });
 
