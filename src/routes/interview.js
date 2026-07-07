@@ -62,12 +62,23 @@ function accessStore(req) {
 async function assertInterviewCreator(req) {
   const memberships = await accessStore(req).listMembershipsForUser(req.user.id);
   const ownsLegacy = memberships.some((m) => m.is_owner);
-  if (!ownsLegacy) {
+  if (ownsLegacy) return memberships;
+
+  const { data: ownCreator } = await req.supabase
+    .from('legacy_creators')
+    .select('id')
+    .eq('user_id', req.user.id)
+    .maybeSingle();
+  if (ownCreator?.id) return memberships;
+
+  if (memberships.length > 0) {
     const err = new Error('The interview is only for people preserving their own legacy.');
     err.status = 403;
     err.code = 'FAMILY_VIEWER';
     throw err;
   }
+
+  // No memberships yet — a new creator starting their own legacy.
   return memberships;
 }
 
@@ -266,7 +277,7 @@ router.get('/session', async (req, res) => {
       dbMode: 'supabase',
     });
   } catch (err) {
-    res.status(500).json({ error: err.message });
+    res.status(err.status || 500).json({ error: err.message, code: err.code || undefined });
   }
 });
 
