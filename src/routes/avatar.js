@@ -1029,6 +1029,44 @@ router.post('/say', async (req, res) => {
   }
 });
 
+/* GET /api/avatar/video/:videoId/stream — proxy HeyGen MP4 (CDN often blocks direct browser loads). */
+router.get('/video/:videoId/stream', async (req, res) => {
+  try {
+    if (!process.env.HEYGEN_API_KEY) {
+      return res.status(503).json({ error: 'Talking video is not configured (missing HEYGEN_API_KEY).' });
+    }
+    const status = await getVideoStatus(req.params.videoId);
+    if (status.status !== 'completed' || !status.url) {
+      const code = status.status === 'failed' ? 502 : 425;
+      return res.status(code).json({
+        error: status.error || 'Video not ready yet',
+        status: status.status,
+      });
+    }
+
+    const upstreamHeaders = {};
+    if (req.headers.range) upstreamHeaders.Range = req.headers.range;
+
+    const upstream = await fetch(status.url, { headers: upstreamHeaders });
+    if (!upstream.ok && upstream.status !== 206) {
+      return res.status(502).json({ error: `Could not load video from HeyGen (${upstream.status})` });
+    }
+
+    res.status(upstream.status);
+    for (const name of ['content-type', 'content-length', 'content-range', 'accept-ranges']) {
+      const val = upstream.headers.get(name);
+      if (val) res.setHeader(name, val);
+    }
+    if (!res.getHeader('content-type')) res.setHeader('Content-Type', 'video/mp4');
+    res.setHeader('Cache-Control', 'private, max-age=3600');
+
+    res.send(Buffer.from(await upstream.arrayBuffer()));
+  } catch (e) {
+    console.error('[avatar/video/stream] failed:', e);
+    res.status(502).json({ error: e.message });
+  }
+});
+
 /* GET /api/avatar/video/:videoId — poll a HeyGen render. */
 router.get('/video/:videoId', async (req, res) => {
   try {
