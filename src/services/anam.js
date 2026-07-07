@@ -89,6 +89,17 @@ export async function deleteAvatar(avatarId) {
   await parse(res, 'delete avatar');
 }
 
+/** Delete a cloned voice on Anam (best-effort; 404 is OK). */
+export async function deleteVoice(voiceId) {
+  if (!voiceId) return;
+  const res = await fetch(`${BASE_URL}/v1/voices/${voiceId}`, {
+    method: 'DELETE',
+    headers: { Authorization: `Bearer ${apiKey()}` },
+  });
+  if (res.status === 404) return;
+  await parse(res, 'delete voice');
+}
+
 export async function createAvatarFromImageUrl({ displayName, imageUrl }) {
   const res = await fetch(`${BASE_URL}/v1/avatars`, {
     method: 'POST',

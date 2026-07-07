@@ -16,6 +16,7 @@ import {
   isConfigured as anamConfigured,
   listAvatars as anamListAvatars,
   deleteAvatar as anamDeleteAvatar,
+  deleteVoice as anamDeleteVoice,
   createAvatarFromImageUrl as anamCreateAvatar,
   cloneVoice as anamCloneVoice,
   createSessionToken as anamCreateSessionToken,
@@ -323,6 +324,50 @@ async function provisionAnam(req, creator) {
       metadata: { ...meta, anam_status: 'failed', anam_error: e.message },
     });
     throw e;
+  }
+}
+
+function buildProvisionResponse(assets, extra = {}) {
+  return {
+    success: true,
+    status: anamReady(assets) ? 'ready' : (assets?.metadata?.anam_status || 'none'),
+    avatarReady: avatarReady(assets),
+    liveReady: anamReady(assets),
+    heygenPhotoAvatarId: assets?.metadata?.heygen_photo_avatar_id || null,
+    anamAvatarId: assets?.metadata?.anam_avatar_id || null,
+    previewUrl: assets?.metadata?.heygen_avatar_preview_url || null,
+    assets,
+    ...extra,
+  };
+}
+
+function clearedAnamMetadata(meta = {}) {
+  return {
+    ...meta,
+    anam_status: 'none',
+    anam_error: null,
+    anam_avatar_id: null,
+    anam_avatar_portrait_path: null,
+    anam_voice_id: null,
+    anam_voice_sample_path: null,
+    anam_provisioned_at: null,
+  };
+}
+
+/** Run Anam + HeyGen provisioning after the HTTP response (Vercel waitUntil). */
+async function runBackgroundProvision(req, creator) {
+  const ctx = { supabase: req.supabase, admin: req.admin, user: req.user };
+  try {
+    if (anamConfigured()) {
+      await provisionAnam(ctx, creator);
+    }
+    try {
+      await provisionCreatorAvatar(ctx, creator);
+    } catch (e) {
+      console.warn('[avatar/provision/bg] HeyGen:', e.message);
+    }
+  } catch (e) {
+    console.error('[avatar/provision/bg] failed:', e);
   }
 }
 
@@ -1001,45 +1046,103 @@ router.get('/video/:videoId', async (req, res) => {
 /* GET /api/avatar/greeting-text — the fixed greeting used for the studio preview. */
 router.get('/greeting-text', (_req, res) => res.json({ text: AVATAR_GREETING }));
 
+/* DELETE /api/avatar/live — remove Anam live avatar + voice; keeps portrait/voice sample for re-provision. */
+router.delete('/live', async (req, res) => {
+  try {
+    const creator = await getOwnedCreator(req);
+    if (!creator) return res.status(404).json({ error: 'No legacy found for this user' });
+
+    const assets = await getAssets(req, creator.id);
+    const meta = assets?.metadata || {};
+    const warnings = [];
+
+    if (anamConfigured()) {
+      if (meta.anam_avatar_id) {
+        try {
+          await anamDeleteAvatar(meta.anam_avatar_id);
+        } catch (e) {
+          warnings.push(`Anam avatar: ${e.message}`);
+        }
+      }
+      if (meta.anam_voice_id) {
+        try {
+          await anamDeleteVoice(meta.anam_voice_id);
+        } catch (e) {
+          warnings.push(`Anam voice: ${e.message}`);
+        }
+      }
+    }
+
+    const saved = assets
+      ? await upsertAssets(req, creator.id, { metadata: clearedAnamMetadata(meta) })
+      : null;
+
+    res.json({
+      success: true,
+      liveReady: false,
+      hasPortrait: Boolean(saved?.portrait_path),
+      hasVoiceSample: Boolean(saved?.voice_sample_path),
+      warnings,
+      assets: saved,
+    });
+  } catch (e) {
+    console.error('[avatar/live/delete] failed:', e);
+    res.status(502).json({ error: e.message });
+  }
+});
+
 /* POST /api/avatar/provision — set up the creator's avatar from their photo + voice:
-   HeyGen photo avatar (async talking video) and Anam live avatar + cloned voice
-   (real-time live call). Both are created automatically from the uploaded media. */
+   Anam live avatar + cloned voice (real-time call) and HeyGen photo avatar (talking video).
+   On Vercel, Anam runs in the background — client polls GET /assets until liveReady. */
 router.post('/provision', async (req, res) => {
   try {
     const creator = await getOwnedCreator(req);
     if (!creator) return res.status(404).json({ error: 'No legacy found for this user' });
 
-    // HeyGen photo avatar for the async talking video (best-effort).
-    let assets = null;
-    let heygenError = null;
-    try {
-      assets = await provisionCreatorAvatar(req, creator);
-    } catch (e) {
-      heygenError = e.message;
+    let assets = await getAssets(req, creator.id);
+    if (anamReady(assets)) {
+      return res.json(buildProvisionResponse(assets));
     }
 
-    // Anam live avatar + voice for the real-time call (the user's own face + voice).
-    let anamError = null;
-    if (anamConfigured()) {
-      try {
-        assets = await provisionAnam(req, creator);
-      } catch (e) {
-        anamError = e.message;
-      }
+    const meta = assets?.metadata || {};
+    if (meta.anam_status === 'processing') {
+      return res.status(202).json(buildProvisionResponse(assets || { metadata: meta }, {
+        status: 'processing',
+        liveReady: false,
+        message: 'Creating your live avatar. This usually takes about a minute.',
+      }));
     }
 
-    if (!assets) assets = await getAssets(req, creator.id);
-    res.json({
-      success: true,
-      avatarReady: avatarReady(assets),
-      liveReady: anamReady(assets),
-      heygenPhotoAvatarId: assets?.metadata?.heygen_photo_avatar_id || null,
-      anamAvatarId: assets?.metadata?.anam_avatar_id || null,
-      previewUrl: assets?.metadata?.heygen_avatar_preview_url || null,
-      heygenError,
-      anamError,
-      assets,
+    if (!assets?.portrait_path || !assets?.voice_sample_path) {
+      return res.status(409).json({
+        error: 'Add a portrait photo and voice sample in the Avatar Studio first.',
+      });
+    }
+
+    if (!anamConfigured()) {
+      return res.status(503).json({ error: 'Live calls require ANAM_API_KEY.' });
+    }
+
+    await upsertAssets(req, creator.id, {
+      metadata: { ...meta, anam_status: 'processing', anam_error: null },
     });
+
+    const onVercel = Boolean(process.env.VERCEL);
+    if (onVercel) {
+      const { waitUntil } = await import('@vercel/functions');
+      waitUntil(runBackgroundProvision(req, creator));
+      return res.status(202).json({
+        success: true,
+        status: 'processing',
+        liveReady: false,
+        avatarReady: avatarReady(assets),
+        message: 'Creating your live avatar. This usually takes about a minute.',
+      });
+    }
+
+    await runBackgroundProvision(req, creator);
+    assets = await getAssets(req, creator.id);
+    return res.json(buildProvisionResponse(assets));
   } catch (e) {
     console.error('[avatar/provision] failed:', e);
     const status = e.message.includes('first') ? 409 : 502;

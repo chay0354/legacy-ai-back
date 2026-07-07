@@ -61,8 +61,8 @@ function accessStore(req) {
 /** Family members/admins must never start the creator interview flow. */
 async function assertInterviewCreator(req) {
   const memberships = await accessStore(req).listMembershipsForUser(req.user.id);
-  const shared = memberships.filter((m) => !m.is_owner);
-  if (shared.length > 0) {
+  const ownsLegacy = memberships.some((m) => m.is_owner);
+  if (!ownsLegacy) {
     const err = new Error('The interview is only for people preserving their own legacy.');
     err.status = 403;
     err.code = 'FAMILY_VIEWER';

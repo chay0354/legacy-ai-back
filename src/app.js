@@ -13,6 +13,7 @@ function corsOrigins() {
   const origins = new Set([
     'http://localhost:5173',
     'http://localhost:3000',
+    'https://legacy-ai-front.vercel.app',
   ]);
 
   for (const raw of [process.env.FRONTEND_URL, process.env.VERCEL_URL, process.env.VERCEL_BRANCH_URL]) {
@@ -76,6 +77,10 @@ export function createApp() {
       dbMode: getPool() ? 'postgres' : 'supabase-api',
       supabaseUrl: process.env.SUPABASE_URL,
     });
+  });
+
+  app.get('/', (_req, res) => {
+    res.json({ status: 'ok', service: 'legacy-ai-back' });
   });
 
   app.use('/api/auth', authRouter);
