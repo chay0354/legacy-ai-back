@@ -27,23 +27,28 @@ export function defaultLlmId() {
   return process.env.ANAM_LLM_ID || 'ANAM_GPT_4O_MINI_V1';
 }
 
-/** Cara 3 is default for one-shot avatars; cara-4-latest needs org access. */
+/** Cara 4 is generally available; cara-4-latest needs org early access. */
 export function defaultAvatarModel() {
-  return process.env.ANAM_AVATAR_MODEL || 'cara-3';
+  return process.env.ANAM_AVATAR_MODEL || 'cara-4';
 }
 
-/** Pin max bitrate + native frame size so the stream doesn't start low and upscale blurry. */
+/**
+ * Browser live calls: prefer adaptive bitrate (`auto`) so the stream can drop
+ * quality instead of freezing when the network/CPU can't hold max Cara-4 bitrate.
+ * Set ANAM_VIDEO_QUALITY=high only on very strong connections.
+ */
 export function buildSessionOptions() {
   const model = defaultAvatarModel();
-  const quality = process.env.ANAM_VIDEO_QUALITY || 'high';
-  const opts = { videoQuality: quality === 'auto' ? 'auto' : 'high' };
+  const qualityRaw = (process.env.ANAM_VIDEO_QUALITY || 'auto').toLowerCase();
+  const opts = { videoQuality: qualityRaw === 'high' ? 'high' : 'auto' };
 
   const w = process.env.ANAM_VIDEO_WIDTH;
   const h = process.env.ANAM_VIDEO_HEIGHT;
   if (w && h) {
     opts.videoWidth = parseInt(w, 10);
     opts.videoHeight = parseInt(h, 10);
-  } else if (model === 'cara-4-latest') {
+  } else if (model.startsWith('cara-4')) {
+    // Cara 4 native landscape. With videoQuality=auto, Anam ABR can still adapt bitrate.
     opts.videoWidth = 1152;
     opts.videoHeight = 768;
   } else {
@@ -124,7 +129,7 @@ export async function createAvatarFromImageUrl({ displayName, imageUrl }) {
 export async function cloneVoice({ name, buffer, contentType = 'audio/wav', filename = 'voice-sample.wav', language = 'en' }) {
   const form = new FormData();
   form.append('name', name.slice(0, 50));
-  form.append('language', language);
+  form.append('language', language || 'en');
   form.append('audioFile', new Blob([buffer], { type: contentType }), filename);
 
   const res = await fetch(`${BASE_URL}/v1/voices`, {
@@ -142,15 +147,30 @@ export async function cloneVoice({ name, buffer, contentType = 'audio/wav', file
  * Mint a short-lived (1h) session token for an ephemeral persona. The frontend
  * SDK uses it to open the live WebRTC call.
  */
-export async function createSessionToken({ name, avatarId, voiceId, llmId, systemPrompt, initialMessage }) {
+export async function createSessionToken({
+  name,
+  avatarId,
+  voiceId,
+  llmId,
+  systemPrompt,
+  initialMessage,
+  languageCode = 'en',
+}) {
+  if (!avatarId) throw new Error('Live Call requires an Anam avatar id.');
+  if (!voiceId) {
+    throw new Error('Live Call requires a cloned Anam voice — stock voice fallback is disabled.');
+  }
+
   const personaConfig = {
     name: (name || 'Legacy').slice(0, 50),
     avatarId,
+    voiceId,
     avatarModel: defaultAvatarModel(),
     llmId: llmId || defaultLlmId(),
+    // Speech recognition language (Anam multilingual docs).
+    languageCode: languageCode || 'en',
     systemPrompt: (systemPrompt || 'You are a warm, present person speaking with family.').slice(0, 12000),
   };
-  if (voiceId) personaConfig.voiceId = voiceId;
   if (initialMessage) personaConfig.initialMessage = initialMessage.slice(0, 1000);
 
   const res = await fetch(`${BASE_URL}/v1/auth/session-token`, {

@@ -755,6 +755,7 @@ router.post('/voice/realtime/token', async (req, res) => {
       anchorQuestion,
       questionIndex = 0,
       totalQuestions = 1,
+      priorTopics = [],
     } = req.body || {};
 
     if (!anchorQuestion) return res.status(400).json({ error: 'anchorQuestion required' });
@@ -765,6 +766,8 @@ router.post('/voice/realtime/token', async (req, res) => {
       anchorQuestion,
       questionIndex,
       totalQuestions,
+      priorTopics,
+      isOpening: Number(questionIndex) === 0,
     });
 
     res.json(secret);
@@ -787,6 +790,7 @@ router.post('/voice/realtime/session', async (req, res) => {
       anchorQuestion,
       questionIndex = 0,
       totalQuestions = 1,
+      priorTopics = [],
     } = req.body || {};
 
     if (typeof sdp !== 'string' || !sdp.trim()) return res.status(400).json({ error: 'sdp required' });
@@ -801,6 +805,8 @@ router.post('/voice/realtime/session', async (req, res) => {
       anchorQuestion,
       questionIndex,
       totalQuestions,
+      priorTopics,
+      isOpening: Number(questionIndex) === 0,
     });
 
     res.type('application/sdp').send(answerSdp);
@@ -819,6 +825,7 @@ router.post('/voice/realtime/instructions', (req, res) => {
       anchorQuestion,
       questionIndex = 0,
       totalQuestions = 1,
+      priorTopics = [],
     } = req.body || {};
 
     if (!anchorQuestion) return res.status(400).json({ error: 'anchorQuestion required' });
@@ -830,6 +837,8 @@ router.post('/voice/realtime/instructions', (req, res) => {
         anchorQuestion,
         questionIndex,
         totalQuestions,
+        priorTopics,
+        isOpening: Number(questionIndex) === 0,
       }),
     });
   } catch (err) {

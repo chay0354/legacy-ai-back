@@ -11,11 +11,17 @@ import {
   cloneVoice as anamCloneVoice,
   createSessionToken as anamCreateSessionToken,
   buildSessionOptions as anamBuildSessionOptions,
+  defaultAvatarModel as anamDefaultAvatarModel,
 } from '../services/anam.js';
 import { makeAccessStore } from '../db/accessRepo.js';
+import { normalizeAnamLanguage } from '../anamLanguages.js';
 
 const router = Router();
 const BUCKET = 'legacy-media';
+
+function resolveAnamLanguage(assets, override) {
+  return normalizeAnamLanguage(override ?? assets?.metadata?.anam_language);
+}
 
 /** Resolve the creator owned by the signed-in user (the avatar's subject). */
 async function getOwnedCreator(req) {
@@ -119,9 +125,29 @@ function avatarReady(assets) {
   return Boolean(assets?.portrait_path && voiceReady(assets));
 }
 
-/** True when the Anam live avatar (face) + voice are provisioned for this creator. */
+/** True when Anam has a cloned voice for the current sample + selected language — no stock fallback. */
+function anamVoiceReady(assets) {
+  const meta = assets?.metadata || {};
+  if (!meta.anam_voice_id) return false;
+  // Re-record invalidates readiness until we clone the new sample.
+  if (
+    meta.anam_voice_sample_path
+    && assets?.voice_sample_path
+    && meta.anam_voice_sample_path !== assets.voice_sample_path
+  ) {
+    return false;
+  }
+  // Language change requires a fresh Anam voice clone.
+  const selected = resolveAnamLanguage(assets);
+  if (meta.anam_voice_language && meta.anam_voice_language !== selected) {
+    return false;
+  }
+  return true;
+}
+
+/** True when the Anam live face AND cloned voice are provisioned. Face alone is not enough. */
 function anamReady(assets) {
-  return Boolean(assets?.metadata?.anam_avatar_id);
+  return Boolean(assets?.metadata?.anam_avatar_id && anamVoiceReady(assets));
 }
 
 function anamDisplayName(creator) {
@@ -174,12 +200,18 @@ async function provisionAnam(req, creator) {
   const portraitKey = assets.portrait_path;
   const voiceKey = assets.voice_sample_path;
 
-  const haveAvatar = meta.anam_avatar_id && meta.anam_avatar_portrait_path === portraitKey;
-  const haveVoice = meta.anam_voice_id && meta.anam_voice_sample_path === voiceKey;
+  const language = resolveAnamLanguage(assets);
+  const avatarModel = anamDefaultAvatarModel();
+  const haveAvatar = meta.anam_avatar_id
+    && meta.anam_avatar_portrait_path === portraitKey
+    && meta.anam_avatar_model === avatarModel;
+  const haveVoice = meta.anam_voice_id
+    && meta.anam_voice_sample_path === voiceKey
+    && meta.anam_voice_language === language;
   if (haveAvatar && haveVoice) return assets;
 
   await upsertAssets(req, creator.id, {
-    metadata: { ...meta, anam_status: 'processing', anam_error: null },
+    metadata: { ...meta, anam_language: language, anam_status: 'processing', anam_error: null },
   });
 
   try {
@@ -190,8 +222,8 @@ async function provisionAnam(req, creator) {
     if (!anamAvatarId) {
       const portraitUrl = await signed(req, portraitKey);
       if (!portraitUrl) throw new Error('Could not read the portrait photo.');
-      // Portrait changed — drop the previous one-shot so Free-plan slot limits aren't hit.
-      if (meta.anam_avatar_id && meta.anam_avatar_portrait_path !== portraitKey) {
+      // Portrait or model changed — drop the previous one-shot so Free-plan slot limits aren't hit.
+      if (meta.anam_avatar_id && (meta.anam_avatar_portrait_path !== portraitKey || meta.anam_avatar_model !== avatarModel)) {
         try {
           await anamDeleteAvatar(meta.anam_avatar_id);
         } catch (e) {
@@ -201,8 +233,15 @@ async function provisionAnam(req, creator) {
       anamAvatarId = await createAnamAvatarWithSlotRetry(creator, portraitUrl);
     }
 
-    // Voice — clone from the recorded sample stored in Supabase.
+    // Voice — clone from the recorded sample stored in Supabase (language from Studio selector).
     if (!anamVoiceId) {
+      if (meta.anam_voice_id && meta.anam_voice_language !== language) {
+        try {
+          await anamDeleteVoice(meta.anam_voice_id);
+        } catch (e) {
+          console.warn('[avatar/anam] old voice delete failed:', e.message);
+        }
+      }
       const { data: file, error: dlError } = await req.supabase.storage.from(BUCKET).download(voiceKey);
       if (dlError || !file) throw new Error(`Could not read voice sample: ${dlError?.message || 'not found'}`);
       const buffer = Buffer.from(await file.arrayBuffer());
@@ -213,18 +252,22 @@ async function provisionAnam(req, creator) {
         buffer,
         contentType,
         filename: `voice.${ext === 'mp3' ? 'mp3' : 'wav'}`,
+        language,
       });
     }
 
     return upsertAssets(req, creator.id, {
       metadata: {
         ...meta,
+        anam_language: language,
         anam_status: 'ready',
         anam_error: null,
         anam_avatar_id: anamAvatarId,
         anam_avatar_portrait_path: portraitKey,
+        anam_avatar_model: avatarModel,
         anam_voice_id: anamVoiceId,
         anam_voice_sample_path: voiceKey,
+        anam_voice_language: language,
         anam_provisioned_at: new Date().toISOString(),
       },
     });
@@ -455,10 +498,10 @@ router.post('/voice-sample', async (req, res) => {
   }
 });
 
-/* POST /api/avatar/voice { voiceSamplePath } — clone the creator's voice via ElevenLabs. */
+/* POST /api/avatar/voice { voiceSamplePath, language? } — clone via ElevenLabs; store Anam language for Live Call. */
 router.post('/voice', async (req, res) => {
   try {
-    const { voiceSamplePath } = req.body || {};
+    const { voiceSamplePath, language } = req.body || {};
     if (!voiceSamplePath) return res.status(400).json({ error: 'voiceSamplePath required' });
 
     const creator = await getOwnedCreator(req);
@@ -468,6 +511,7 @@ router.post('/voice', async (req, res) => {
       return res.status(503).json({ error: 'Voice cloning requires ELEVENLABS_API_KEY.' });
     }
 
+    const anamLanguage = normalizeAnamLanguage(language);
     await upsertAssets(req, creator.id, { voice_sample_path: voiceSamplePath, voice_status: 'processing' });
 
     const { data: file, error: dlError } = await req.supabase.storage.from(BUCKET).download(voiceSamplePath);
@@ -478,6 +522,7 @@ router.post('/voice', async (req, res) => {
 
     const buffer = Buffer.from(await file.arrayBuffer());
     const existing = await getAssets(req, creator.id);
+    const prevMeta = existing?.metadata || {};
 
     let cloned;
     try {
@@ -493,15 +538,33 @@ router.post('/voice', async (req, res) => {
       await elevenLabsDeleteVoice(prevElVoiceId);
     }
 
+    // Language / sample change means the previous Anam voice clone is stale.
+    if (prevMeta.anam_voice_id && (
+      prevMeta.anam_voice_language !== anamLanguage
+      || prevMeta.anam_voice_sample_path !== voiceSamplePath
+    )) {
+      try {
+        await anamDeleteVoice(prevMeta.anam_voice_id);
+      } catch (e) {
+        console.warn('[avatar/voice] stale Anam voice delete failed:', e.message);
+      }
+    }
+
     const saved = await upsertAssets(req, creator.id, {
       voice_id: cloned.voiceId,
       voice_provider: cloned.provider,
       voice_status: 'ready',
       metadata: {
-        ...(existing?.metadata || {}),
+        ...prevMeta,
         cloned: true,
         voice_provider: cloned.provider,
         elevenlabs_voice_id: cloned.elevenlabsVoiceId,
+        anam_language: anamLanguage,
+        // Force Live Call re-provision with the selected language.
+        anam_voice_id: null,
+        anam_voice_sample_path: null,
+        anam_voice_language: null,
+        anam_status: prevMeta.anam_avatar_id ? 'none' : (prevMeta.anam_status || 'none'),
       },
     });
 
@@ -597,7 +660,15 @@ async function buildAvatarContext(req, creatorId) {
   };
 }
 
-function buildAvatarSystemPrompt(ctx) {
+function languageReplyHint(languageCode) {
+  const code = normalizeAnamLanguage(languageCode);
+  if (code === 'en') {
+    return 'Speak in natural English unless the visitor clearly uses another language.';
+  }
+  return `Prefer speaking in language code "${code}" (the language chosen when this voice was created), matching the visitor when they use that language.`;
+}
+
+function buildAvatarSystemPrompt(ctx, languageCode = 'en') {
   const phrases = ctx.personality?.favorite_phrases?.length
     ? `Favorite phrases (use them naturally, do not overuse): ${ctx.personality.favorite_phrases.join(' | ')}`
     : '';
@@ -634,6 +705,7 @@ HARD RULES:
 3. Keep replies SHORT and spoken — 2 to 4 sentences. They will be voiced aloud by your avatar.
 4. Write the way you'd actually speak aloud: short sentences, natural pauses (commas), contractions, and a warm conversational rhythm. Avoid bullet points, lists, or formal written tone.
 5. Stay in character. Never mention being an AI, a model, or "preserved data."
+6. ${languageReplyHint(languageCode)}
 
 ${style}
 ${phrases}
@@ -688,37 +760,42 @@ router.post('/live/start', async (req, res) => {
     const creatorId = await resolveTalkCreatorId(req);
     if (!creatorId) return res.status(404).json({ error: 'No legacy specified' });
 
-    // The creator's own Anam face + voice. Provision on demand if the owner is calling;
-    // viewers rely on the owner having provisioned already.
+    // The creator's own Anam face + cloned voice. No stock-voice fallback.
+    // Provision on demand if the owner is calling; viewers need the owner to finish Studio.
     let assets = await getAssetsForViewer(req, creatorId);
-    let usingOwnFace = anamReady(assets);
-    if (!usingOwnFace) {
+    if (!anamReady(assets)) {
       const owned = await getOwnedCreator(req);
       if (owned?.id === creatorId) {
         try {
           assets = await provisionAnam(req, owned);
-          usingOwnFace = anamReady(assets);
         } catch (e) {
           console.warn('[avatar/live/start] provision failed:', e.message);
+          return res.status(409).json({
+            error: e.message || 'Could not set up your live avatar. Finish Avatar Studio (photo + voice) and try again.',
+          });
         }
       }
     }
 
     const avatarId = assets?.metadata?.anam_avatar_id;
-    if (!avatarId) {
+    const voiceId = assets?.metadata?.anam_voice_id;
+    if (!avatarId || !voiceId || !anamReady(assets)) {
       return res.status(409).json({
-        error: 'This legacy needs a photo and voice in the Avatar Studio before a live call. The owner should open Avatar Studio and finish setup.',
+        error: !voiceId
+          ? 'Your voice was not cloned successfully. Re-record in Avatar Studio and generate the live avatar again — Live Call will not start with a stock voice.'
+          : 'This legacy needs a photo and cloned voice in Avatar Studio before a live call. The owner should finish setup there.',
       });
     }
-    const voiceId = assets?.metadata?.anam_voice_id || undefined;
 
+    const languageCode = resolveAnamLanguage(assets);
     const ctx = await buildAvatarContext(req, creatorId);
-    const systemPrompt = buildAvatarSystemPrompt(ctx);
+    const systemPrompt = buildAvatarSystemPrompt(ctx, languageCode);
 
     const sessionToken = await anamCreateSessionToken({
       name: ctx.name,
       avatarId,
       voiceId,
+      languageCode,
       systemPrompt,
       initialMessage: `Hello. It's me — ${ctx.name}. I'm right here. Ask me anything.`,
     });
@@ -726,7 +803,8 @@ router.post('/live/start', async (req, res) => {
     res.json({
       sessionToken,
       usingOwnFace: true,
-      usingOwnVoice: Boolean(voiceId),
+      usingOwnVoice: true,
+      languageCode,
       creatorId,
       videoProfile: anamBuildSessionOptions(),
     });
