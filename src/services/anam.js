@@ -105,6 +105,16 @@ export async function deleteVoice(voiceId) {
   await parse(res, 'delete voice');
 }
 
+/** Fetch a voice by id. Returns null if missing (404) — used to block stock fallback. */
+export async function getVoice(voiceId) {
+  if (!voiceId) return null;
+  const res = await fetch(`${BASE_URL}/v1/voices/${voiceId}`, {
+    headers: { Authorization: `Bearer ${apiKey()}`, Accept: 'application/json' },
+  });
+  if (res.status === 404) return null;
+  return parse(res, 'get voice');
+}
+
 export async function createAvatarFromImageUrl({ displayName, imageUrl }) {
   const res = await fetch(`${BASE_URL}/v1/avatars`, {
     method: 'POST',

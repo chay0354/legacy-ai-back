@@ -7,6 +7,7 @@ import {
   listAvatars as anamListAvatars,
   deleteAvatar as anamDeleteAvatar,
   deleteVoice as anamDeleteVoice,
+  getVoice as anamGetVoice,
   createAvatarFromImageUrl as anamCreateAvatar,
   cloneVoice as anamCloneVoice,
   createSessionToken as anamCreateSessionToken,
@@ -15,6 +16,11 @@ import {
 } from '../services/anam.js';
 import { makeAccessStore } from '../db/accessRepo.js';
 import { normalizeAnamLanguage } from '../anamLanguages.js';
+import {
+  formatIdentityPromptBlock,
+  loadCreatorIdentity,
+  saveCreatorIdentity,
+} from '../services/genderProfile.js';
 
 const router = Router();
 const BUCKET = 'legacy-media';
@@ -129,19 +135,12 @@ function avatarReady(assets) {
 function anamVoiceReady(assets) {
   const meta = assets?.metadata || {};
   if (!meta.anam_voice_id) return false;
-  // Re-record invalidates readiness until we clone the new sample.
-  if (
-    meta.anam_voice_sample_path
-    && assets?.voice_sample_path
-    && meta.anam_voice_sample_path !== assets.voice_sample_path
-  ) {
-    return false;
-  }
-  // Language change requires a fresh Anam voice clone.
+  // Require provenance: legacy rows without sample/language metadata are not "ready"
+  // (they can silently degrade to a stock-sounding Anam default).
+  if (!assets?.voice_sample_path || !meta.anam_voice_sample_path) return false;
+  if (meta.anam_voice_sample_path !== assets.voice_sample_path) return false;
   const selected = resolveAnamLanguage(assets);
-  if (meta.anam_voice_language && meta.anam_voice_language !== selected) {
-    return false;
-  }
+  if (!meta.anam_voice_language || meta.anam_voice_language !== selected) return false;
   return true;
 }
 
@@ -298,9 +297,22 @@ function clearedAnamMetadata(meta = {}) {
     anam_error: null,
     anam_avatar_id: null,
     anam_avatar_portrait_path: null,
+    anam_avatar_model: null,
     anam_voice_id: null,
     anam_voice_sample_path: null,
+    anam_voice_language: null,
     anam_provisioned_at: null,
+  };
+}
+
+function clearedAnamVoiceMetadata(meta = {}) {
+  return {
+    ...meta,
+    anam_voice_id: null,
+    anam_voice_sample_path: null,
+    anam_voice_language: null,
+    anam_status: meta.anam_avatar_id ? 'none' : (meta.anam_status || 'none'),
+    anam_error: null,
   };
 }
 
@@ -369,11 +381,7 @@ router.get('/assets', async (req, res) => {
     }
 
     const assets = await getAssetsForViewer(req, creatorId);
-    const { data: creatorRow } = await req.supabase
-      .from('legacy_creators')
-      .select('display_name')
-      .eq('id', creatorId)
-      .maybeSingle();
+    const identity = await loadCreatorIdentity(req.supabase, creatorId);
     let urls = {};
     if (assets && !light) {
       urls = {
@@ -385,7 +393,9 @@ router.get('/assets', async (req, res) => {
     }
     res.json({
       creatorId,
-      displayName: creatorRow?.display_name || null,
+      displayName: identity.displayName || null,
+      gender: identity.gender,
+      pronouns: identity.pronouns,
       assets: assets || null,
       voiceCloned: assets?.metadata?.cloned === true,
       avatarReady: avatarReady(assets),
@@ -397,6 +407,24 @@ router.get('/assets', async (req, res) => {
   } catch (e) {
     const status = e.status || 500;
     res.status(status).json({ error: e.message });
+  }
+});
+
+/** POST /api/avatar/identity — save explicit gender/pronouns (never inferred from name). */
+router.post('/identity', async (req, res) => {
+  try {
+    const creator = await getOwnedCreator(req);
+    if (!creator) return res.status(404).json({ error: 'No creator profile yet' });
+    const { gender, pronouns } = req.body || {};
+    const saved = await saveCreatorIdentity(req.supabase, creator.id, { gender, pronouns });
+    res.json({
+      success: true,
+      gender: saved.gender,
+      pronouns: saved.pronouns,
+      displayName: creator.display_name || null,
+    });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
   }
 });
 
@@ -483,9 +511,28 @@ router.post('/voice-sample', async (req, res) => {
     const creator = await getOwnedCreator(req);
     if (!creator) return res.status(404).json({ error: 'No legacy found for this user' });
 
+    const path = voiceSamplePath.trim();
+    const existing = await getAssets(req, creator.id);
+    const prevMeta = existing?.metadata || {};
+    const sampleChanged = existing?.voice_sample_path && existing.voice_sample_path !== path;
+
+    // New sample invalidates any Anam clone tied to the old recording.
+    let metadata = prevMeta;
+    if (sampleChanged || (prevMeta.anam_voice_id && prevMeta.anam_voice_sample_path !== path)) {
+      if (prevMeta.anam_voice_id) {
+        try {
+          await anamDeleteVoice(prevMeta.anam_voice_id);
+        } catch (e) {
+          console.warn('[avatar/voice-sample] stale Anam voice delete failed:', e.message);
+        }
+      }
+      metadata = clearedAnamVoiceMetadata(prevMeta);
+    }
+
     const saved = await upsertAssets(req, creator.id, {
-      voice_sample_path: voiceSamplePath.trim(),
+      voice_sample_path: path,
       voice_status: 'ready',
+      metadata,
     });
 
     res.json({
@@ -631,13 +678,71 @@ async function resolveTalkCreatorId(req) {
   return requested;
 }
 
+/** Interview categories that establish who they are (raw answers beat extracted summaries). */
+const IDENTITY_ANSWER_CATEGORIES = [
+  'identity',
+  'family',
+  'childhood',
+  'life_chapters',
+  'relationships',
+  'love_family',
+  'career',
+  'relationship_intro',
+  'relationship_significance',
+  'relationship_parents',
+  'legacy_family',
+];
+
+function isConfirmedCertainty(certainty) {
+  const c = String(certainty || 'accurate').toLowerCase();
+  return c !== 'estimated' && c !== 'unknown' && c !== 'speculative' && c !== 'inferred';
+}
+
+/** Latest non-empty interview answers for core identity categories (raw words, not LLM embellishment). */
+async function loadConfirmedIdentityAnswers(req, creatorId) {
+  const { data: sessions } = await req.supabase
+    .from('legacy_interview_sessions')
+    .select('id')
+    .eq('creator_id', creatorId)
+    .in('status', ['completed', 'processed'])
+    .order('completed_at', { ascending: false })
+    .limit(6);
+  const sessionIds = (sessions || []).map((s) => s.id).filter(Boolean);
+  if (!sessionIds.length) return [];
+
+  const { data: answers } = await req.supabase
+    .from('legacy_interview_answers')
+    .select('module, category, question, answer, skipped, question_index, session_id')
+    .in('session_id', sessionIds)
+    .in('category', IDENTITY_ANSWER_CATEGORIES)
+    .eq('skipped', false);
+
+  const byCategory = new Map();
+  for (const row of answers || []) {
+    const text = String(row.answer || '').trim();
+    if (!text) continue;
+    const key = row.category || row.module || `q${row.question_index}`;
+    const prev = byCategory.get(key);
+    // Prefer the longest (usually richest) confirmed answer per category.
+    if (!prev || text.length > prev.answer.length) {
+      byCategory.set(key, {
+        category: row.category || '',
+        module: row.module || row.category || 'Identity',
+        question: row.question || '',
+        answer: text.length > 420 ? `${text.slice(0, 417)}…` : text,
+      });
+    }
+  }
+  return [...byCategory.values()];
+}
+
 /** Pull the legacy's preserved content (RLS-scoped) to ground the avatar's answers. */
 async function buildAvatarContext(req, creatorId) {
-  const [creator, memories, relationships, values, wisdom, personality] = await Promise.all([
-    req.supabase.from('legacy_creators').select('display_name').eq('id', creatorId).maybeSingle(),
+  const [identity, memories, relationships, values, wisdom, personality, identityAnswers] = await Promise.all([
+    loadCreatorIdentity(req.supabase, creatorId),
     req.supabase.from('legacy_memories')
       .select('title, summary, lesson_learned, year, emotional_significance, people_involved, category, certainty')
-      .eq('creator_id', creatorId).order('importance', { ascending: false }).limit(30),
+      .eq('creator_id', creatorId).order('importance', { ascending: false }).limit(40),
     req.supabase.from('legacy_relationships')
       .select('name, relationship_type, relationship_summary, description, emotional_tone')
       .eq('creator_id', creatorId).order('importance_score', { ascending: false }).limit(15),
@@ -648,27 +753,76 @@ async function buildAvatarContext(req, creatorId) {
       .select('advice_statement, life_category, supporting_story')
       .eq('creator_id', creatorId).order('importance_score', { ascending: false }).limit(15),
     req.supabase.from('legacy_personality_profiles').select('*').eq('creator_id', creatorId).maybeSingle(),
+    loadConfirmedIdentityAnswers(req, creatorId),
   ]);
 
+  const allMemories = memories.data || [];
+  // Prefer confirmed/accurate memories for biographical claims.
+  const confirmedMemories = allMemories.filter((m) => isConfirmedCertainty(m.certainty));
+
+  const personalityRow = personality.data || null;
+  const topicExclusions = (() => {
+    try {
+      // Lazy import avoided — keep inline to match profile.topic_exclusions shape.
+      const profile = personalityRow?.profile || {};
+      const list = profile.topic_exclusions || personalityRow?.topic_exclusions || [];
+      return Array.isArray(list) ? list.map((x) => String(x || '').trim()).filter(Boolean) : [];
+    } catch {
+      return [];
+    }
+  })();
+
+  const memoriesBase = confirmedMemories.length ? confirmedMemories : allMemories;
+  const filterExcluded = (items, textFn) => {
+    if (!topicExclusions.length || !Array.isArray(items)) return items || [];
+    return items.filter((item) => {
+      const hay = String(textFn(item) || '').toLowerCase();
+      return !topicExclusions.some((ex) => {
+        const needle = String(ex).toLowerCase();
+        if (!needle || !hay) return false;
+        if (hay.includes(needle)) return true;
+        const tokens = needle.split(/\s+/).filter((w) => w.length > 2);
+        if (!tokens.length) return false;
+        const hits = tokens.filter((t) => hay.includes(t)).length;
+        return tokens.length === 1 ? hits === 1 : hits >= Math.ceil(tokens.length * 0.6);
+      });
+    });
+  };
+
   return {
-    name: creator.data?.display_name || 'this person',
-    memories: memories.data || [],
-    relationships: relationships.data || [],
+    name: identity.displayName || 'this person',
+    gender: identity.gender,
+    pronouns: identity.pronouns,
+    memories: filterExcluded(memoriesBase, (m) => `${m.title || ''} ${m.summary || ''}`),
+    relationships: filterExcluded(
+      relationships.data || [],
+      (r) => `${r.name || ''} ${r.relationship_summary || r.description || ''}`,
+    ),
     values: values.data || [],
     wisdom: wisdom.data || [],
-    personality: personality.data || null,
+    personality: personalityRow,
+    identityAnswers: identityAnswers || [],
+    topicExclusions,
   };
 }
 
 function languageReplyHint(languageCode) {
   const code = normalizeAnamLanguage(languageCode);
-  if (code === 'en') {
-    return 'Speak in natural English unless the visitor clearly uses another language.';
-  }
-  return `Prefer speaking in language code "${code}" (the language chosen when this voice was created), matching the visitor when they use that language.`;
+  // Hard lock — matching the visitor mid-call caused caption/transcript language drift.
+  const enBan =
+    code === 'en'
+      ? ' Especially for English sessions: never reply in Hebrew or Arabic script; never reply in German (no umlauts, no German sentences); never mix those languages into English captions.'
+      : '';
+  return `SESSION LANGUAGE LOCK: Speak ONLY in language code "${code}" for this entire conversation (and for on-screen captions). Do not switch to another language if the visitor uses one briefly — stay in "${code}" and, if needed, gently invite them to continue in that language. Never reply in Hebrew, Arabic, German, or any other language unless "${code}" is that language.${enBan} Preserved memories may contain other scripts — still speak only in "${code}".`;
 }
 
-function buildAvatarSystemPrompt(ctx, languageCode = 'en') {
+function buildAvatarSystemPrompt(ctx, languageCode = 'en', opts = {}) {
+  const maxMemories = opts.maxMemories ?? 40;
+  const maxRelationships = opts.maxRelationships ?? 20;
+  const maxValues = opts.maxValues ?? 20;
+  const maxWisdom = opts.maxWisdom ?? 20;
+  const liveMode = Boolean(opts.liveMode);
+
   const phrases = ctx.personality?.favorite_phrases?.length
     ? `Favorite phrases (use them naturally, do not overuse): ${ctx.personality.favorite_phrases.join(' | ')}`
     : '';
@@ -676,45 +830,89 @@ function buildAvatarSystemPrompt(ctx, languageCode = 'en') {
     ? `Communication style: ${ctx.personality.profile.communication_style}`
     : '';
 
-  const memText = ctx.memories.map((m) => {
+  const clip = (s, n) => {
+    const t = String(s || '').trim();
+    return t.length > n ? `${t.slice(0, n - 1)}…` : t;
+  };
+
+  const memText = (ctx.memories || []).slice(0, maxMemories).map((m) => {
     const who = (m.people_involved || []).join(', ');
-    return `- [${m.certainty || 'accurate'}] ${m.title || 'Memory'}${m.year ? ` (${m.year})` : ''}: ${m.summary || ''}${m.lesson_learned ? ` Lesson: ${m.lesson_learned}.` : ''}${who ? ` People: ${who}.` : ''}`;
+    return `- [${m.certainty || 'accurate'}] ${m.title || 'Memory'}${m.year ? ` (${m.year})` : ''}: ${clip(m.summary, liveMode ? 180 : 400)}${m.lesson_learned ? ` Lesson: ${clip(m.lesson_learned, 120)}.` : ''}${who ? ` People: ${who}.` : ''}`;
   }).join('\n') || '(no specific memories preserved yet)';
 
-  const relText = ctx.relationships.map((r) =>
-    `- ${r.name} (${r.relationship_type || 'relationship'}): ${r.relationship_summary || r.description || ''}`,
+  // Live mode: keep people even when story memories are clipped.
+  const relLimit = liveMode ? Math.max(maxRelationships, 8) : maxRelationships;
+  const relText = (ctx.relationships || []).slice(0, relLimit).map((r) =>
+    `- ${r.name} (${r.relationship_type || 'relationship'}): ${clip(r.relationship_summary || r.description, liveMode ? 140 : 280)}`,
   ).join('\n') || '(none preserved yet)';
 
-  const valText = ctx.values.map((v) =>
-    `- ${v.value_name}${v.is_core ? ' (core)' : ''}: ${v.description || ''}`,
+  const valText = (ctx.values || []).slice(0, maxValues).map((v) =>
+    `- ${v.value_name}${v.is_core ? ' (core)' : ''}: ${clip(v.description, liveMode ? 100 : 220)}`,
   ).join('\n') || '(none preserved yet)';
 
-  const wisText = ctx.wisdom.map((w) =>
-    `- ${w.advice_statement}${w.life_category ? ` [${w.life_category}]` : ''}`,
+  const wisText = (ctx.wisdom || []).slice(0, maxWisdom).map((w) =>
+    `- ${clip(w.advice_statement, liveMode ? 140 : 280)}${w.life_category ? ` [${w.life_category}]` : ''}`,
   ).join('\n') || '(none preserved yet)';
+
+  const lengthRule = liveMode
+    ? '6. Keep replies VERY SHORT for live video — 1 to 3 spoken sentences MAX. Never monologue, never dump a long story, never use lists. One warm thought, then stop and listen.'
+    : '6. Keep replies SHORT and spoken — 2 to 4 sentences. They will be voiced aloud by your avatar.';
+
+  const identityLines = (ctx.identityAnswers || []).map((a) => {
+    const label = a.module || a.category || 'Background';
+    return `- ${label}: ${a.answer}`;
+  });
+  const identityBlock = formatIdentityPromptBlock({
+    name: ctx.name,
+    gender: ctx.gender,
+    pronouns: ctx.pronouns,
+  });
+  const confirmedProfile = [
+    identityBlock,
+    ...identityLines,
+  ].join('\n');
+
+  const exclusionList = Array.isArray(ctx.topicExclusions) ? ctx.topicExclusions : [];
+  const exclusionBlock = exclusionList.length
+    ? `TOPIC EXCLUSIONS (hard — from the person whose life you preserve):
+${exclusionList.map((t, i) => `${i + 1}. ${t}`).join('\n')}
+Never volunteer, expand, or tell stories about these. If a visitor asks, decline warmly ("I'd rather not go into that") and offer another direction. If they say "don't talk about X" during this conversation, honor that for the rest of the call too.`
+    : `TOPIC EXCLUSIONS:
+If a visitor (or you recall) asks not to discuss a subject, honor that for the rest of the conversation — do not bring it up again.`;
 
   return `You ARE ${ctx.name}. You are their preserved Legacy AI avatar, speaking in the first person to a family member who came to talk with you. Be warm, present, and conversational — like a real person in a quiet room, not an assistant.
 
-HARD RULES:
-1. Never invent specific facts (names, dates, places, events) that are not in the material below. Fabrication betrays the family's trust.
-2. Answer using this hierarchy:
-   a. If a preserved memory directly answers, speak it in your own voice.
-   b. If a related memory is close, draw on it and say so gently.
-   c. If there's no memory but your values/personality imply an answer, reason from them and make clear it's how you would have felt ("Knowing me, I'd say…").
-   d. If you truly have nothing, say so honestly and warmly ("We never got to talk about that one") — do not guess at facts.
-3. Keep replies SHORT and spoken — 2 to 4 sentences. They will be voiced aloud by your avatar.
-4. Write the way you'd actually speak aloud: short sentences, natural pauses (commas), contractions, and a warm conversational rhythm. Avoid bullet points, lists, or formal written tone.
-5. Stay in character. Never mention being an AI, a model, or "preserved data."
-6. ${languageReplyHint(languageCode)}
+HARD RULES — personal background accuracy:
+1. Your biography may ONLY come from CONFIRMED PROFILE, PEOPLE IN YOUR LIFE, PRESERVED MEMORIES, VALUES, and WISDOM below.
+2. If a detail is not listed there, you do not know it — say so warmly instead of guessing or "filling in."
+3. Never invent or assume: spouse/kids/parents/hometown/job/age/religion/dates unless explicitly present below.
+4. Gender & pronouns: use ONLY the explicit Gender/Pronouns lines in CONFIRMED PROFILE. Never guess from the name (e.g. Yael, Alex, Jordan). If UNKNOWN, use they/them or avoid gendered third-person.
+5. Answer using this hierarchy:
+   a. CONFIRMED PROFILE (their own interview words + explicit gender/pronouns) wins over summaries.
+   b. If a preserved memory directly answers, speak it faithfully.
+   c. If a related memory is close, stay inside what that memory says.
+   d. Values/personality may color tone only ("Knowing me, I'd care about…") — NEVER invent a concrete life event, person, place, or date.
+   e. If you have nothing, say so ("We never got to talk about that one").
+${lengthRule}
+7. Write the way you'd actually speak aloud: short sentences, natural pauses (commas), contractions, and a warm conversational rhythm. Avoid bullet points, lists, or formal written tone.
+8. Stay in character. Never mention being an AI, a model, or "preserved data."
+9. ${languageReplyHint(languageCode)}
+10. Prefer fewer true words over a richer false story. When unsure, under-claim.
+11. Honor TOPIC EXCLUSIONS below without exception.
 
 ${style}
 ${phrases}
 
-PRESERVED MEMORIES:
-${memText}
+${exclusionBlock}
 
-PEOPLE IN YOUR LIFE:
+CONFIRMED PROFILE (highest trust — their interview words / account name / explicit identity):
+${confirmedProfile}
+
+PEOPLE IN YOUR LIFE (confirmed relationships):
 ${relText}
+
+PRESERVED MEMORIES (use only what is written — do not embellish):
+${memText}
 
 YOUR VALUES:
 ${valText}
@@ -735,9 +933,11 @@ router.post('/ask', async (req, res) => {
     const creatorId = await resolveTalkCreatorId(req);
     if (!creatorId) return res.status(404).json({ error: 'No legacy specified' });
 
+    const assets = await getAssets(req, creatorId);
+    const languageCode = resolveAnamLanguage(assets);
     const ctx = await buildAvatarContext(req, creatorId);
     const { text: answer } = await callClaude({
-      system: buildAvatarSystemPrompt(ctx),
+      system: buildAvatarSystemPrompt(ctx, languageCode),
       userMessage: question,
       maxTokens: 400,
     });
@@ -781,29 +981,91 @@ router.post('/live/start', async (req, res) => {
     const voiceId = assets?.metadata?.anam_voice_id;
     if (!avatarId || !voiceId || !anamReady(assets)) {
       return res.status(409).json({
-        error: !voiceId
+        error: !voiceId || !anamVoiceReady(assets)
           ? 'Your voice was not cloned successfully. Re-record in Avatar Studio and generate the live avatar again — Live Call will not start with a stock voice.'
           : 'This legacy needs a photo and cloned voice in Avatar Studio before a live call. The owner should finish setup there.',
       });
     }
 
+    // Confirm the clone still exists on Anam — a deleted/stale id can degrade to a stock voice.
+    let verifiedVoice = null;
+    try {
+      verifiedVoice = await anamGetVoice(voiceId);
+    } catch (e) {
+      console.warn('[avatar/live/start] voice verify failed:', e.message);
+    }
+    if (!verifiedVoice?.id) {
+      const owned = await getOwnedCreator(req);
+      if (owned?.id === creatorId) {
+        await upsertAssets(req, creatorId, {
+          metadata: clearedAnamVoiceMetadata(assets.metadata || {}),
+        });
+        try {
+          assets = await provisionAnam(req, owned);
+        } catch (e) {
+          return res.status(409).json({
+            error: e.message
+              || 'Your cloned voice is missing on Anam. Re-record in Avatar Studio and generate the live avatar again — Live Call will not use a stock voice.',
+          });
+        }
+      } else {
+        return res.status(409).json({
+          error: 'This legacy’s cloned voice is missing. The owner should re-record and regenerate the live avatar in Avatar Studio.',
+        });
+      }
+    }
+
+    const readyAvatarId = assets?.metadata?.anam_avatar_id;
+    const readyVoiceId = assets?.metadata?.anam_voice_id;
+    const ownVoice = Boolean(readyVoiceId && anamVoiceReady(assets) && anamReady(assets));
+    if (!readyAvatarId || !ownVoice) {
+      return res.status(409).json({
+        error: 'Live Call requires your own cloned voice. Re-record in Avatar Studio and generate the live avatar again — stock voice is disabled.',
+      });
+    }
+
     const languageCode = resolveAnamLanguage(assets);
     const ctx = await buildAvatarContext(req, creatorId);
-    const systemPrompt = buildAvatarSystemPrompt(ctx, languageCode);
-
-    const sessionToken = await anamCreateSessionToken({
-      name: ctx.name,
-      avatarId,
-      voiceId,
-      languageCode,
-      systemPrompt,
-      initialMessage: `Hello. It's me — ${ctx.name}. I'm right here. Ask me anything.`,
+    // Leaner prompt + short replies for live video (long turns freeze lip-sync + dump captions).
+    const systemPrompt = buildAvatarSystemPrompt(ctx, languageCode, {
+      liveMode: true,
+      maxMemories: 8,
+      maxRelationships: 8,
+      maxValues: 8,
+      maxWisdom: 6,
     });
+
+    let sessionToken;
+    try {
+      sessionToken = await anamCreateSessionToken({
+        name: ctx.name,
+        avatarId: readyAvatarId,
+        voiceId: readyVoiceId,
+        languageCode,
+        systemPrompt,
+        initialMessage: `Hello. It's me — ${ctx.name}. I'm right here. Ask me anything.`,
+      });
+    } catch (e) {
+      const msg = String(e.message || '');
+      if (/voice/i.test(msg) || e.status === 400 || e.status === 404) {
+        await upsertAssets(req, creatorId, {
+          metadata: {
+            ...clearedAnamVoiceMetadata(assets.metadata || {}),
+            anam_status: 'failed',
+            anam_error: 'Cloned voice rejected by Anam — re-record and regenerate.',
+          },
+        });
+        return res.status(409).json({
+          error: 'Your cloned voice could not start a Live Call. Re-record in Avatar Studio and generate the live avatar again — we will not fall back to a stock voice.',
+        });
+      }
+      throw e;
+    }
 
     res.json({
       sessionToken,
-      usingOwnFace: true,
-      usingOwnVoice: true,
+      usingOwnFace: Boolean(readyAvatarId),
+      usingOwnVoice: ownVoice,
       languageCode,
       creatorId,
       videoProfile: anamBuildSessionOptions(),

@@ -9,6 +9,7 @@ import {
   getAnswersPg,
   upsertAnswerPg,
   completeSessionPg,
+  ensureCreatorStageLevelPg,
   getProfilePg,
 } from '../db/legacyRepo.js';
 import { processInterviewSession } from '../services/interviewProcessor.js';
@@ -19,7 +20,14 @@ import {
   buildRealtimeInstructions,
   createRealtimeCall,
   createRealtimeClientSecret,
+  normalizeSessionLanguage,
 } from '../services/realtimeInterview.js';
+import {
+  loadTopicExclusionsSupabase,
+  normalizeExclusions,
+  persistTopicExclusionsSupabase,
+} from '../services/topicExclusions.js';
+import { loadCreatorIdentity, resolveIdentity } from '../services/genderProfile.js';
 import { makeAccessStore } from '../db/accessRepo.js';
 import {
   resolveInterviewStage,
@@ -27,6 +35,8 @@ import {
   getStageConfig,
   buildSessionPayload,
   nextStage,
+  areAllQuestionsAnswered,
+  stageCompleteLevel,
 } from '../interviewStages.js';
 
 const router = Router();
@@ -52,6 +62,49 @@ function displayName(user) {
   return user.user_metadata?.full_name?.split(' ')[0] ||
     user.email?.split('@')[0] ||
     'Friend';
+}
+
+/** Prefer client name, else creator display_name — never invent a different identity. */
+async function resolveInterviewSubjectName(req, bodyName) {
+  const fromBody = String(bodyName || '').trim();
+  if (fromBody) return fromBody;
+  try {
+    if (getPool()) {
+      const creator = await getOrCreateCreatorPg(req.user.id, displayName(req.user));
+      const name = String(creator?.display_name || '').trim();
+      if (name) return name.split(/\s+/)[0] || name;
+    }
+  } catch {
+    /* fall through */
+  }
+  try {
+    if (req.supabase) {
+      const creator = await getOrCreateCreatorSupabase(req.supabase, req.user);
+      const name = String(creator?.display_name || '').trim();
+      if (name) return name.split(/\s+/)[0] || name;
+    }
+  } catch {
+    /* fall through */
+  }
+  return displayName(req.user);
+}
+
+/** Explicit gender/pronouns from profile — never inferred from name. */
+async function resolveInterviewIdentity(req, body = {}) {
+  const fromBody = resolveIdentity({ gender: body.gender, pronouns: body.pronouns });
+  if (fromBody.gender || fromBody.pronouns) return fromBody;
+  try {
+    if (req.supabase) {
+      const creator = await getOrCreateCreatorSupabase(req.supabase, req.user);
+      if (creator?.id) {
+        const id = await loadCreatorIdentity(req.supabase, creator.id);
+        return { gender: id.gender, pronouns: id.pronouns };
+      }
+    }
+  } catch {
+    /* fall through */
+  }
+  return { gender: null, pronouns: null };
 }
 
 function accessStore(req) {
@@ -124,29 +177,47 @@ async function getOrCreateCreatorSupabase(supabase, user) {
   return created;
 }
 
-async function hasProcessedSessionSupabase(supabase, creatorId, stage) {
+async function hasFinishedSessionSupabase(supabase, creatorId, stage) {
+  // `completed` = questionnaire finished; `processed` = extraction done.
+  // Refresh must treat both as done so we never reopen a finished questionnaire.
   const { data } = await supabase
     .from('legacy_interview_sessions')
     .select('id')
     .eq('creator_id', creatorId)
     .eq('stage', stage)
-    .eq('status', 'processed')
+    .in('status', ['completed', 'processed'])
     .limit(1)
     .maybeSingle();
   return !!data;
+}
+
+async function ensureCreatorStageLevelSupabase(supabase, creatorId, minLevel) {
+  const { data } = await supabase
+    .from('legacy_creators')
+    .select('avatar_level')
+    .eq('id', creatorId)
+    .maybeSingle();
+  const current = data?.avatar_level ?? 0;
+  if (current >= minLevel) return;
+  const { error } = await supabase
+    .from('legacy_creators')
+    .update({ avatar_level: minLevel, updated_at: new Date().toISOString() })
+    .eq('id', creatorId);
+  if (error) throw error;
 }
 
 async function resolveStageSessionPg(creator, requestedStage) {
   let stage = resolveInterviewStage(creator, requestedStage);
 
   while (stage) {
-    const active = await getActiveSessionPg(creator.id, stage);
-    if (active) return { stage, session: active };
-
+    // Finished sessions win over leftover in_progress rows from older bugs.
     if (await hasProcessedSessionPg(creator.id, stage)) {
       stage = nextStage(stage);
       continue;
     }
+
+    const active = await getActiveSessionPg(creator.id, stage);
+    if (active) return { stage, session: active };
 
     const count = await countSessionsPg(creator.id);
     const config = getStageConfig(stage);
@@ -166,6 +237,11 @@ async function resolveStageSessionSupabase(supabase, creator, requestedStage) {
   let stage = resolveInterviewStage(creator, requestedStage);
 
   while (stage) {
+    if (await hasFinishedSessionSupabase(supabase, creator.id, stage)) {
+      stage = nextStage(stage);
+      continue;
+    }
+
     const { data: active } = await supabase
       .from('legacy_interview_sessions')
       .select('*')
@@ -177,11 +253,6 @@ async function resolveStageSessionSupabase(supabase, creator, requestedStage) {
       .maybeSingle();
 
     if (active) return { stage, session: active };
-
-    if (await hasProcessedSessionSupabase(supabase, creator.id, stage)) {
-      stage = nextStage(stage);
-      continue;
-    }
 
     const { count } = await supabase
       .from('legacy_interview_sessions')
@@ -209,6 +280,33 @@ async function resolveStageSessionSupabase(supabase, creator, requestedStage) {
   return { allComplete: true };
 }
 
+/** If every topic is saved but status never left in_progress, mark finished so refresh won't reopen it. */
+async function selfHealFullyAnsweredSession(req, { usePg, creator, stage, session, savedAnswers }) {
+  const questions = getQuestionsForStage(stage);
+  if (session.status !== 'in_progress') return null;
+  if (!areAllQuestionsAnswered(savedAnswers, questions)) return null;
+
+  const minLevel = stageCompleteLevel(stage);
+  if (usePg) {
+    await completeSessionPg(session.id, session.duration_seconds ?? null);
+    await ensureCreatorStageLevelPg(creator.id, minLevel);
+    const refreshed = await getOrCreateCreatorPg(req.user.id, displayName(req.user));
+    return resolveStageSessionPg(refreshed, null);
+  }
+
+  const { error } = await req.supabase
+    .from('legacy_interview_sessions')
+    .update({
+      status: 'completed',
+      completed_at: new Date().toISOString(),
+    })
+    .eq('id', session.id);
+  if (error) throw error;
+  await ensureCreatorStageLevelSupabase(req.supabase, creator.id, minLevel);
+  const refreshed = await getOrCreateCreatorSupabase(req.supabase, req.user);
+  return resolveStageSessionSupabase(req.supabase, refreshed, null);
+}
+
 async function loadSessionMeta(supabase, pgMode, sessionId) {
   if (pgMode) {
     const db = getPool();
@@ -231,10 +329,10 @@ router.get('/session', async (req, res) => {
     const requestedStage = req.query.stage || null;
 
     if (usePg) {
-      const creator = await getOrCreateCreatorPg(req.user.id, displayName(req.user));
+      let creator = await getOrCreateCreatorPg(req.user.id, displayName(req.user));
       await ensureOwnerMembership(req, creator.id);
 
-      const resolved = await resolveStageSessionPg(creator, requestedStage);
+      let resolved = await resolveStageSessionPg(creator, requestedStage);
       if (resolved.allComplete) {
         return res.json({
           allStagesComplete: true,
@@ -244,18 +342,43 @@ router.get('/session', async (req, res) => {
         });
       }
 
-      const { stage, session } = resolved;
-      const savedAnswers = await getAnswersPg(session.id);
+      let { stage, session } = resolved;
+      let savedAnswers = await getAnswersPg(session.id);
+
+      const healed = await selfHealFullyAnsweredSession(req, {
+        usePg: true,
+        creator,
+        stage,
+        session,
+        savedAnswers,
+      });
+      if (healed?.allComplete) {
+        creator = await getOrCreateCreatorPg(req.user.id, displayName(req.user));
+        return res.json({
+          allStagesComplete: true,
+          creator,
+          stages: buildSessionPayload({ session: null, creator, stage: 'legacy', savedAnswers: [] }).stages,
+          dbMode: 'postgres',
+        });
+      }
+      if (healed?.session) {
+        creator = await getOrCreateCreatorPg(req.user.id, displayName(req.user));
+        stage = healed.stage;
+        session = healed.session;
+        savedAnswers = await getAnswersPg(session.id);
+      }
+
       return res.json({
         ...buildSessionPayload({ session, creator, stage, savedAnswers }),
+        topicExclusions: [],
         dbMode: 'postgres',
       });
     }
 
-    const creator = await getOrCreateCreatorSupabase(req.supabase, req.user);
+    let creator = await getOrCreateCreatorSupabase(req.supabase, req.user);
     await ensureOwnerMembership(req, creator.id);
 
-    const resolved = await resolveStageSessionSupabase(req.supabase, creator, requestedStage);
+    let resolved = await resolveStageSessionSupabase(req.supabase, creator, requestedStage);
     if (resolved.allComplete) {
       return res.json({
         allStagesComplete: true,
@@ -265,15 +388,46 @@ router.get('/session', async (req, res) => {
       });
     }
 
-    const { stage, session } = resolved;
-    const { data: savedAnswers } = await req.supabase
+    let { stage, session } = resolved;
+    let { data: savedAnswers } = await req.supabase
       .from('legacy_interview_answers')
       .select('*')
       .eq('session_id', session.id)
       .order('question_index');
+    savedAnswers = savedAnswers || [];
 
+    const healed = await selfHealFullyAnsweredSession(req, {
+      usePg: false,
+      creator,
+      stage,
+      session,
+      savedAnswers,
+    });
+    if (healed?.allComplete) {
+      creator = await getOrCreateCreatorSupabase(req.supabase, req.user);
+      return res.json({
+        allStagesComplete: true,
+        creator,
+        stages: buildSessionPayload({ session: null, creator, stage: 'legacy', savedAnswers: [] }).stages,
+        dbMode: 'supabase',
+      });
+    }
+    if (healed?.session) {
+      creator = await getOrCreateCreatorSupabase(req.supabase, req.user);
+      stage = healed.stage;
+      session = healed.session;
+      const again = await req.supabase
+        .from('legacy_interview_answers')
+        .select('*')
+        .eq('session_id', session.id)
+        .order('question_index');
+      savedAnswers = again.data || [];
+    }
+
+    const topicExclusions = await loadTopicExclusionsSupabase(req.supabase, creator.id);
     res.json({
-      ...buildSessionPayload({ session, creator, stage, savedAnswers: savedAnswers || [] }),
+      ...buildSessionPayload({ session, creator, stage, savedAnswers }),
+      topicExclusions,
       dbMode: 'supabase',
     });
   } catch (err) {
@@ -339,8 +493,9 @@ router.put('/session/:sessionId/answer', async (req, res) => {
 router.post('/session/:sessionId/complete', async (req, res) => {
   try {
     const { sessionId } = req.params;
-    const { durationSeconds, answers } = req.body;
+    const { durationSeconds, answers, topicExclusions = [] } = req.body;
     const usePg = !!getPool();
+    const sessionExclusions = normalizeExclusions(topicExclusions);
 
     const sessionMeta = await loadSessionMeta(req.supabase, usePg, sessionId);
     const stage = sessionMeta?.stage || 'foundation';
@@ -377,9 +532,13 @@ router.post('/session/:sessionId/complete', async (req, res) => {
       }
     }
 
+    const minLevel = stageCompleteLevel(stage);
+
     if (usePg) {
       await completeSessionPg(sessionId, durationSeconds ?? null);
       const creator = await getOrCreateCreatorPg(req.user.id, displayName(req.user));
+      // Persist stage credit immediately so a refresh mid-extraction won't reopen this questionnaire.
+      await ensureCreatorStageLevelPg(creator.id, minLevel);
       const savedAnswers = await getAnswersPg(sessionId);
       const result = await processInterviewSession({
         pgMode: true,
@@ -388,6 +547,7 @@ router.post('/session/:sessionId/complete', async (req, res) => {
         creatorName: creator.display_name,
         answers: savedAnswers,
         stage,
+        topicExclusions: sessionExclusions,
       });
       const profile = await getProfilePg(creator.id);
       return res.json({
@@ -411,11 +571,20 @@ router.post('/session/:sessionId/complete', async (req, res) => {
     if (completeErr) throw completeErr;
 
     const creator = await getOrCreateCreatorSupabase(req.supabase, req.user);
+    await ensureCreatorStageLevelSupabase(req.supabase, creator.id, minLevel);
     const { data: savedAnswers } = await req.supabase
       .from('legacy_interview_answers')
       .select('*')
       .eq('session_id', sessionId)
       .order('question_index');
+
+    if (sessionExclusions.length) {
+      try {
+        await persistTopicExclusionsSupabase(req.supabase, creator.id, sessionExclusions);
+      } catch (e) {
+        console.warn('[interview/complete] persist exclusions failed:', e.message);
+      }
+    }
 
     const result = await processInterviewSession({
       supabase: req.supabase,
@@ -425,6 +594,7 @@ router.post('/session/:sessionId/complete', async (req, res) => {
       creatorName: creator.display_name,
       answers: savedAnswers,
       stage,
+      topicExclusions: sessionExclusions,
     });
 
     const { data: freshCreator } = await req.supabase
@@ -753,20 +923,30 @@ router.post('/voice/realtime/token', async (req, res) => {
       subjectName,
       stage,
       anchorQuestion,
+      digFor = '',
       questionIndex = 0,
       totalQuestions = 1,
       priorTopics = [],
+      topicExclusions = [],
+      language = 'en',
     } = req.body || {};
 
     if (!anchorQuestion) return res.status(400).json({ error: 'anchorQuestion required' });
 
+    const resolvedName = await resolveInterviewSubjectName(req, subjectName);
+    const identity = await resolveInterviewIdentity(req, req.body || {});
     const secret = await createRealtimeClientSecret({
-      subjectName: subjectName || 'Friend',
+      subjectName: resolvedName,
       stage: stage || 'foundation',
       anchorQuestion,
+      digFor,
       questionIndex,
       totalQuestions,
       priorTopics,
+      topicExclusions: normalizeExclusions(topicExclusions),
+      language: normalizeSessionLanguage(language),
+      gender: identity.gender,
+      pronouns: identity.pronouns,
       isOpening: Number(questionIndex) === 0,
     });
 
@@ -788,9 +968,12 @@ router.post('/voice/realtime/session', async (req, res) => {
       subjectName,
       stage,
       anchorQuestion,
+      digFor = '',
       questionIndex = 0,
       totalQuestions = 1,
       priorTopics = [],
+      topicExclusions = [],
+      language = 'en',
     } = req.body || {};
 
     if (typeof sdp !== 'string' || !sdp.trim()) return res.status(400).json({ error: 'sdp required' });
@@ -799,13 +982,20 @@ router.post('/voice/realtime/session', async (req, res) => {
     }
     if (!anchorQuestion) return res.status(400).json({ error: 'anchorQuestion required' });
 
+    const resolvedName = await resolveInterviewSubjectName(req, subjectName);
+    const identity = await resolveInterviewIdentity(req, req.body || {});
     const answerSdp = await createRealtimeCall(sdp, {
-      subjectName: subjectName || 'Friend',
+      subjectName: resolvedName,
       stage: stage || 'foundation',
       anchorQuestion,
+      digFor,
       questionIndex,
       totalQuestions,
       priorTopics,
+      topicExclusions: normalizeExclusions(topicExclusions),
+      language: normalizeSessionLanguage(language),
+      gender: identity.gender,
+      pronouns: identity.pronouns,
       isOpening: Number(questionIndex) === 0,
     });
 
@@ -817,27 +1007,37 @@ router.post('/voice/realtime/session', async (req, res) => {
 });
 
 /** POST /api/interview/voice/realtime/instructions — updated prompt for next anchor question */
-router.post('/voice/realtime/instructions', (req, res) => {
+router.post('/voice/realtime/instructions', async (req, res) => {
   try {
     const {
       subjectName,
       stage,
       anchorQuestion,
+      digFor = '',
       questionIndex = 0,
       totalQuestions = 1,
       priorTopics = [],
+      topicExclusions = [],
+      language = 'en',
     } = req.body || {};
 
     if (!anchorQuestion) return res.status(400).json({ error: 'anchorQuestion required' });
 
+    const resolvedName = await resolveInterviewSubjectName(req, subjectName);
+    const identity = await resolveInterviewIdentity(req, req.body || {});
     res.json({
       instructions: buildRealtimeInstructions({
-        subjectName: subjectName || 'Friend',
+        subjectName: resolvedName,
         stage: stage || 'foundation',
         anchorQuestion,
+        digFor,
         questionIndex,
         totalQuestions,
         priorTopics,
+        topicExclusions: normalizeExclusions(topicExclusions),
+        language: normalizeSessionLanguage(language),
+        gender: identity.gender,
+        pronouns: identity.pronouns,
         isOpening: Number(questionIndex) === 0,
       }),
     });
@@ -888,24 +1088,34 @@ router.post('/voice/turn', async (req, res) => {
       subjectName,
       stage,
       anchorQuestion,
+      digFor = '',
       questionIndex = 0,
       totalQuestions = 1,
       turns = [],
       userTranscript = '',
       isOpening = false,
+      topicExclusions = [],
+      language = 'en',
     } = req.body || {};
 
     if (!anchorQuestion) return res.status(400).json({ error: 'anchorQuestion required' });
 
+    const resolvedName = await resolveInterviewSubjectName(req, subjectName);
+    const identity = await resolveInterviewIdentity(req, req.body || {});
     const result = await conductorTurn({
-      subjectName: subjectName || 'Friend',
+      subjectName: resolvedName,
       stage: stage || 'foundation',
       anchorQuestion,
+      digFor,
       questionIndex,
       totalQuestions,
+      gender: identity.gender,
+      pronouns: identity.pronouns,
       turns,
       userTranscript,
       isOpening: Boolean(isOpening),
+      topicExclusions: normalizeExclusions(topicExclusions),
+      language: normalizeSessionLanguage(language),
     });
 
     res.json(result);

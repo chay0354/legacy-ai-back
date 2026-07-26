@@ -27,15 +27,28 @@ export async function getActiveSessionPg(creatorId, stage) {
   return rows[0] || null;
 }
 
+/** Stage is done once the questionnaire is finished — including before extraction finishes (`completed`). */
 export async function hasProcessedSessionPg(creatorId, stage) {
   const db = getPool();
   const { rows } = await db.query(
     `SELECT 1 FROM legacy_interview_sessions
-     WHERE creator_id = $1 AND stage = $2 AND status = 'processed'
+     WHERE creator_id = $1 AND stage = $2 AND status IN ('completed', 'processed')
      LIMIT 1`,
     [creatorId, stage]
   );
   return rows.length > 0;
+}
+
+/** Credit the stage as soon as the interview is finished (don't wait on extraction). */
+export async function ensureCreatorStageLevelPg(creatorId, minLevel) {
+  const db = getPool();
+  await db.query(
+    `UPDATE legacy_creators SET
+       avatar_level = GREATEST(COALESCE(avatar_level, 0), $2),
+       updated_at = now()
+     WHERE id = $1`,
+    [creatorId, minLevel],
+  );
 }
 
 export async function createSessionPg(creatorId, sessionNumber, label, stage = 'foundation') {
@@ -162,12 +175,47 @@ export async function saveExtractionPg(creatorId, sessionId, extracted) {
       }
     }
 
-    if (extracted.personality) {
+    if (extracted.personality || (extracted._topicExclusions || []).length) {
+      const prevRes = await client.query(
+        'SELECT profile, favorite_phrases FROM legacy_personality_profiles WHERE creator_id = $1',
+        [creatorId],
+      );
+      const prevRow = prevRes.rows[0];
+      const prevProfile =
+        prevRow?.profile && typeof prevRow.profile === 'object'
+          ? prevRow.profile
+          : (typeof prevRow?.profile === 'string' ? JSON.parse(prevRow.profile) : {});
+      const nextProfile = {
+        ...prevProfile,
+        ...(extracted.personality && typeof extracted.personality === 'object' ? extracted.personality : {}),
+      };
+      // Never let extraction invent or overwrite explicit identity.
+      delete nextProfile.gender;
+      delete nextProfile.pronouns;
+      if (prevProfile.gender != null) nextProfile.gender = prevProfile.gender;
+      if (prevProfile.pronouns != null) nextProfile.pronouns = prevProfile.pronouns;
+      const prevEx = Array.isArray(prevProfile.topic_exclusions) ? prevProfile.topic_exclusions : [];
+      const nextEx = Array.isArray(nextProfile.topic_exclusions) ? nextProfile.topic_exclusions : [];
+      const sessionEx = Array.isArray(extracted._topicExclusions) ? extracted._topicExclusions : [];
+      const seen = new Set();
+      nextProfile.topic_exclusions = [...prevEx, ...nextEx, ...sessionEx]
+        .map((x) => String(x || '').trim())
+        .filter((x) => {
+          if (!x) return false;
+          const key = x.toLowerCase();
+          if (seen.has(key)) return false;
+          seen.add(key);
+          return true;
+        });
       await client.query(
         `INSERT INTO legacy_personality_profiles (creator_id, profile, favorite_phrases, updated_at)
          VALUES ($1, $2, $3, now())
          ON CONFLICT (creator_id) DO UPDATE SET profile = EXCLUDED.profile, favorite_phrases = EXCLUDED.favorite_phrases, updated_at = now()`,
-        [creatorId, JSON.stringify(extracted.personality), extracted.personality.favorite_phrases || []]
+        [
+          creatorId,
+          JSON.stringify(nextProfile),
+          extracted.personality?.favorite_phrases || prevRow?.favorite_phrases || nextProfile.favorite_phrases || [],
+        ],
       );
     }
 

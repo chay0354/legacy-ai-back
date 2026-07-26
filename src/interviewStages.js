@@ -85,6 +85,17 @@ export function computeResumeIndex(savedAnswers, questions) {
   return savedAnswers?.length ? resumeIndex : 0;
 }
 
+/** True when every topic index has a saved row (including skipped empties). */
+export function areAllQuestionsAnswered(savedAnswers, questions) {
+  const total = questions?.length || 0;
+  if (!total) return false;
+  const answeredIndices = new Set((savedAnswers || []).map((a) => a.question_index));
+  for (let i = 0; i < total; i++) {
+    if (!answeredIndices.has(i)) return false;
+  }
+  return true;
+}
+
 export function buildSessionPayload({ session, creator, stage, savedAnswers }) {
   const config = getStageConfig(stage);
   const questions = config.questions;
@@ -94,7 +105,7 @@ export function buildSessionPayload({ session, creator, stage, savedAnswers }) {
     stage,
     stageLabel: config.shortLabel,
     stageGoal: config.goal,
-    questions: questions.map((q) => ({ q: q.q })),
+    questions: questions.map((q) => ({ q: q.q, digFor: q.digFor || '' })),
     questionMeta: questions,
     savedAnswers: savedAnswers || [],
     resumeIndex: computeResumeIndex(savedAnswers, questions),

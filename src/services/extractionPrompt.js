@@ -41,6 +41,9 @@ Follow the Legacy Interview Blueprint principles:
 - Detect threads: anything interesting the interviewer should revisit later.
 - Coverage is based on whether meaningful questions CAN be answered, not whether all fields are filled.
 - Never invent facts. Only extract what the creator actually said.
+- Do not enrich thin answers with plausible details. If they did not name a person, place, year, or event, leave those fields empty or omit the memory.
+- answer summaries and memory titles must stay faithful to their words — no dramatization.
+- Pronouns (CRITICAL): Never infer gender or pronouns from the creator's name. Use ONLY the explicit profile pronouns provided in the user message. If pronouns are UNKNOWN, use they/them/their or rephrase to avoid gendered third person — NEVER default to he/him or she/her. Do not invent gender or pronouns in personality.
 - When the creator mentions a year or when something happened (e.g. "in 1977", "back in '58"), always set memory.year to the 4-digit year and year_confidence to exact or approximate. Create a separate memory for each distinct dated life event.
 - The life timeline is built ONLY from saved memories. Every dated life event must live in the memories array — not in relationships, values, wisdom, or threads alone.
 - Do not duplicate memories: one memory per distinct event. If the same story was captured in a prior session, skip it. Do not re-insert the same title+year or the same story with slightly different wording.
@@ -110,7 +113,8 @@ Return ONLY valid JSON matching this exact schema (no markdown fences, no text b
     "decision_making_style": "",
     "favorite_phrases": [],
     "storytelling_style": "",
-    "traits": {}
+    "traits": {},
+    "topic_exclusions": []
   }
 }
 
@@ -120,16 +124,30 @@ ${config.avatarLevelRule} Always set avatar_level to at least ${targetLevel} whe
 /** @deprecated use getExtractionSystem('foundation') */
 export const EXTRACTION_SYSTEM = getExtractionSystem('foundation');
 
-export function buildExtractionUserMessage(creatorName, answers, stage = 'foundation') {
+export function buildExtractionUserMessage(
+  creatorName,
+  answers,
+  stage = 'foundation',
+  { gender = null, pronouns = null } = {},
+) {
   const config = STAGE_PROMPTS[stage] || STAGE_PROMPTS.foundation;
   const transcript = answers
     .map((a, i) => `Q${i + 1} [${a.category || 'general'}]: ${a.question}\nA: ${a.skipped ? '(skipped)' : (a.answer || '(no answer)')}`)
     .join('\n\n');
 
+  const genderLine = gender || 'UNKNOWN (not set)';
+  const pronounsLine = pronouns
+    || 'UNKNOWN — use they/them/their only; NEVER he/him or she/her';
+
   return `Creator name: ${creatorName}
+Explicit profile gender: ${genderLine}
+Explicit profile pronouns: ${pronounsLine}
+(Never guess pronouns from the name. All extracted text that refers to the creator in third person must follow these pronouns.)
 
 ${config.title} transcript:
 ${transcript}
 
-Extract all structured legacy knowledge from this interview. Be thorough but faithful to what was actually said.`;
+Extract all structured legacy knowledge from this interview. Be thorough but faithful to what was actually said.
+If they said not to talk about / discuss / bring up certain subjects, list short labels in personality.topic_exclusions.
+Do NOT put gender or pronouns into personality — those are set only via the explicit profile fields above.`;
 }

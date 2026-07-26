@@ -62,5 +62,10 @@ export async function ensureSchema() {
   } catch {
     /* already applied */
   }
+  try {
+    await applyMigration(db, '20250726180000_creator_gender_pronouns.sql');
+  } catch {
+    /* already applied */
+  }
   return true;
 }

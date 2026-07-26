@@ -3,6 +3,8 @@ import { getExtractionSystem, buildExtractionUserMessage } from './extractionPro
 import { saveExtractionPg } from '../db/legacyRepo.js';
 import { getCoverageCategoriesForStage, stageCompleteLevel } from '../interviewStages.js';
 import { filterNewMemories } from './memoryDedupe.js';
+import { mergeExclusions } from './topicExclusions.js';
+import { loadCreatorIdentity } from './genderProfile.js';
 
 function normalizeAnswers(answers) {
   return (answers || []).map((a, i) => ({
@@ -149,11 +151,38 @@ async function saveExtractionSupabase(supabase, creatorId, sessionId, extracted,
     }
   }
 
-  if (extracted.personality) {
+  if (extracted.personality || (extracted._topicExclusions || []).length) {
+    const { data: existingPersonality } = await supabase
+      .from('legacy_personality_profiles')
+      .select('profile, favorite_phrases')
+      .eq('creator_id', creatorId)
+      .maybeSingle();
+    const prevProfile =
+      existingPersonality?.profile && typeof existingPersonality.profile === 'object'
+        ? existingPersonality.profile
+        : {};
+    const nextProfile = {
+      ...prevProfile,
+      ...(extracted.personality && typeof extracted.personality === 'object' ? extracted.personality : {}),
+    };
+    // Never let extraction invent or overwrite explicit identity.
+    delete nextProfile.gender;
+    delete nextProfile.pronouns;
+    if (prevProfile.gender != null) nextProfile.gender = prevProfile.gender;
+    if (prevProfile.pronouns != null) nextProfile.pronouns = prevProfile.pronouns;
+    nextProfile.topic_exclusions = mergeExclusions(
+      prevProfile.topic_exclusions,
+      nextProfile.topic_exclusions,
+      extracted._topicExclusions,
+    );
     const { error } = await supabase.from('legacy_personality_profiles').upsert({
       creator_id: creatorId,
-      profile: extracted.personality,
-      favorite_phrases: extracted.personality.favorite_phrases || [],
+      profile: nextProfile,
+      favorite_phrases:
+        extracted.personality?.favorite_phrases ||
+        existingPersonality?.favorite_phrases ||
+        nextProfile.favorite_phrases ||
+        [],
       updated_at: new Date().toISOString(),
     });
     if (error) throw error;
@@ -190,18 +219,39 @@ async function saveExtractionSupabase(supabase, creatorId, sessionId, extracted,
   if (creatorUpdErr) throw creatorUpdErr;
 }
 
-export async function processInterviewSession({ supabase, pgMode, sessionId, creatorId, creatorName, answers, stage = 'foundation' }) {
+export async function processInterviewSession({
+  supabase,
+  pgMode,
+  sessionId,
+  creatorId,
+  creatorName,
+  answers,
+  stage = 'foundation',
+  topicExclusions = [],
+}) {
   const normalized = normalizeAnswers(answers);
   if (!normalized.length) throw new Error('No answers to process');
 
   const name = creatorName || 'Creator';
   const minLevel = stageCompleteLevel(stage);
 
+  let identity = { gender: null, pronouns: null };
+  if (!pgMode && supabase && creatorId) {
+    try {
+      identity = await loadCreatorIdentity(supabase, creatorId);
+    } catch {
+      /* identity optional for extraction */
+    }
+  }
+
   let extracted;
   try {
     extracted = await callClaudeJson({
       system: getExtractionSystem(stage),
-      userMessage: buildExtractionUserMessage(name, normalized, stage),
+      userMessage: buildExtractionUserMessage(name, normalized, stage, {
+        gender: identity.gender,
+        pronouns: identity.pronouns,
+      }),
       maxTokens: 16384,
     });
   } catch (err) {
@@ -210,6 +260,10 @@ export async function processInterviewSession({ supabase, pgMode, sessionId, cre
   }
 
   extracted.avatar_level = Math.max(extracted.avatar_level ?? minLevel, minLevel);
+  extracted._topicExclusions = mergeExclusions(
+    topicExclusions,
+    extracted.personality?.topic_exclusions,
+  );
 
   if (pgMode) {
     await saveExtractionPg(creatorId, sessionId, extracted);
