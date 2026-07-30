@@ -1,11 +1,10 @@
 /** Explicit gender/pronouns — never infer from display name. */
 
-const GENDER_VALUES = new Set(['female', 'male', 'non_binary', 'unspecified', 'prefer_not_to_say']);
+const GENDER_VALUES = new Set(['female', 'male']);
 
 const PRONOUN_PRESETS = {
   'she/her': { subject: 'she', object: 'her', possessive: 'her' },
   'he/him': { subject: 'he', object: 'him', possessive: 'his' },
-  'they/them': { subject: 'they', object: 'them', possessive: 'their' },
 };
 
 export function normalizeGender(raw) {
@@ -13,9 +12,14 @@ export function normalizeGender(raw) {
   if (!g) return null;
   if (g === 'woman' || g === 'f' || g === 'female') return 'female';
   if (g === 'man' || g === 'm' || g === 'male') return 'male';
-  if (g === 'non-binary' || g === 'nonbinary' || g === 'nb' || g === 'non_binary') return 'non_binary';
-  if (g === 'prefer_not_to_say' || g === 'prefer-not-to-say' || g === 'prefer_not') return 'prefer_not_to_say';
-  if (g === 'unspecified' || g === 'unknown' || g === 'other') return 'unspecified';
+  // Legacy values no longer offered in UI — treat as unset.
+  if (
+    g === 'non-binary' || g === 'nonbinary' || g === 'nb' || g === 'non_binary'
+    || g === 'prefer_not_to_say' || g === 'prefer-not-to-say' || g === 'prefer_not'
+    || g === 'unspecified' || g === 'unknown' || g === 'other'
+  ) {
+    return null;
+  }
   return GENDER_VALUES.has(g) ? g : null;
 }
 
@@ -24,9 +28,8 @@ export function normalizePronouns(raw) {
   if (!p) return null;
   if (p === 'she/her' || p === 'she' || p === 'her') return 'she/her';
   if (p === 'he/him' || p === 'he' || p === 'him') return 'he/him';
-  if (p === 'they/them' || p === 'they' || p === 'them') return 'they/them';
-  // Allow short custom strings (e.g. "she/they")
-  if (p.length <= 40 && /^[a-z/'\- ]+$/i.test(p)) return p;
+  // Legacy they/them no longer offered — treat as unset.
+  if (p === 'they/them' || p === 'they' || p === 'them') return null;
   return null;
 }
 
@@ -35,7 +38,6 @@ export function defaultPronounsForGender(gender) {
   const g = normalizeGender(gender);
   if (g === 'female') return 'she/her';
   if (g === 'male') return 'he/him';
-  if (g === 'non_binary') return 'they/them';
   return null;
 }
 
@@ -49,10 +51,8 @@ export function formatIdentityPromptBlock({ name, gender, pronouns } = {}) {
   const id = resolveIdentity({ gender, pronouns });
   const lines = [`- Preferred / display name: ${name || 'this person'}`];
 
-  if (id.gender && id.gender !== 'unspecified' && id.gender !== 'prefer_not_to_say') {
+  if (id.gender === 'female' || id.gender === 'male') {
     lines.push(`- Gender (explicit profile): ${id.gender}`);
-  } else if (id.gender === 'prefer_not_to_say') {
-    lines.push('- Gender: prefer not to say');
   } else {
     lines.push('- Gender: UNKNOWN (not set on profile)');
   }
@@ -64,12 +64,12 @@ export function formatIdentityPromptBlock({ name, gender, pronouns } = {}) {
       lines.push(`- When referring in third person use: ${forms.subject}/${forms.object}/${forms.possessive}`);
     }
     lines.push(
-      `- HARD RULE: In third person use ONLY ${id.pronouns}. Do not switch to he/him or she/her unless those are the explicit pronouns above.`,
+      `- HARD RULE: In third person use ONLY ${id.pronouns}. Do not switch to the other gendered set unless those are the explicit pronouns above.`,
     );
   } else {
     lines.push('- Pronouns: UNKNOWN (not set on profile)');
     lines.push(
-      '- HARD RULE: Pronouns are UNKNOWN — NEVER use he/him/his or she/her/hers. Use they/them/their, second person ("you"), or the person\'s name. Do not guess.',
+      '- HARD RULE: Pronouns are UNKNOWN — prefer second person ("you") or the person\'s name. Do not guess he/him or she/her from the name.',
     );
   }
 

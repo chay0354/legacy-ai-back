@@ -43,7 +43,7 @@ Follow the Legacy Interview Blueprint principles:
 - Never invent facts. Only extract what the creator actually said.
 - Do not enrich thin answers with plausible details. If they did not name a person, place, year, or event, leave those fields empty or omit the memory.
 - answer summaries and memory titles must stay faithful to their words — no dramatization.
-- Pronouns (CRITICAL): Never infer gender or pronouns from the creator's name. Use ONLY the explicit profile pronouns provided in the user message. If pronouns are UNKNOWN, use they/them/their or rephrase to avoid gendered third person — NEVER default to he/him or she/her. Do not invent gender or pronouns in personality.
+- Pronouns (CRITICAL): Never infer gender or pronouns from the creator's name. Use ONLY the explicit profile pronouns provided in the user message (she/her or he/him). If pronouns are UNKNOWN, rephrase with "you" or the name — never invent pronouns. Do not invent gender or pronouns in personality.
 - When the creator mentions a year or when something happened (e.g. "in 1977", "back in '58"), always set memory.year to the 4-digit year and year_confidence to exact or approximate. Create a separate memory for each distinct dated life event.
 - The life timeline is built ONLY from saved memories. Every dated life event must live in the memories array — not in relationships, values, wisdom, or threads alone.
 - Do not duplicate memories: one memory per distinct event. If the same story was captured in a prior session, skip it. Do not re-insert the same title+year or the same story with slightly different wording.
@@ -137,7 +137,7 @@ export function buildExtractionUserMessage(
 
   const genderLine = gender || 'UNKNOWN (not set)';
   const pronounsLine = pronouns
-    || 'UNKNOWN — use they/them/their only; NEVER he/him or she/her';
+    || 'UNKNOWN — use second person or the name; do not invent he/him or she/her';
 
   return `Creator name: ${creatorName}
 Explicit profile gender: ${genderLine}
