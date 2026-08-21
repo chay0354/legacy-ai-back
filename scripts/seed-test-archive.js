@@ -505,13 +505,46 @@ const COVERAGE = {
 };
 
 const GALLERY = [
-  { title: 'The kitchen table', caption: 'Haifa, around 1994. The table pulled away from the wall for Friday.' },
-  { title: 'The hill behind the house', caption: 'The street I learned to ride on, photographed years later.' },
-  { title: "Zeev's garage", caption: 'Haifa, 2001. Third from the left, holding a wrench I was not qualified to hold.' },
-  { title: 'Under the fig tree', caption: 'Kibbutz Hanaton, June 2013. Eleven minutes before the rain.' },
-  { title: 'The first office', caption: 'Tel Aviv, 2014. Four desks and a product nobody needed.' },
-  { title: 'Ashdod, August', caption: 'The summer Maya put her face in the water.' },
-  { title: 'Itai at the sink', caption: 'Tel Aviv, 2023. The evening the questions started arriving late.' },
+  {
+    title: 'The kitchen table',
+    caption: 'Haifa, around 1994. The table pulled away from the wall for Friday.',
+    url: 'https://images.unsplash.com/photo-1556910103-1c02745aae4d?auto=format&fit=crop&w=900&q=80',
+  },
+  {
+    title: 'The hill behind the house',
+    caption: 'The street I learned to ride on, photographed years later.',
+    url: 'https://images.unsplash.com/photo-1477959858617-67f85cf4f1df?auto=format&fit=crop&w=900&q=80',
+  },
+  {
+    title: "Zeev's garage",
+    caption: 'Haifa, 2001. Third from the left, holding a wrench I was not qualified to hold.',
+    url: 'https://images.unsplash.com/photo-1486262715619-67b85e0b08d3?auto=format&fit=crop&w=900&q=80',
+  },
+  {
+    title: 'Under the fig tree',
+    caption: 'Kibbutz Hanaton, June 2013. Eleven minutes before the rain.',
+    url: 'https://images.unsplash.com/photo-1464366400600-7168b8af9bc3?auto=format&fit=crop&w=900&q=80',
+  },
+  {
+    title: 'The first office',
+    caption: 'Tel Aviv, 2014. Four desks and a product nobody needed.',
+    url: 'https://images.unsplash.com/photo-1497366216548-37526070297c?auto=format&fit=crop&w=900&q=80',
+  },
+  {
+    title: 'Ashdod, August',
+    caption: 'The summer Maya put her face in the water.',
+    url: 'https://images.unsplash.com/photo-1507525428034-b723cf961d3e?auto=format&fit=crop&w=900&q=80',
+  },
+  {
+    title: 'Itai at the sink',
+    caption: 'Tel Aviv, 2023. The evening the questions started arriving late.',
+    url: 'https://images.unsplash.com/photo-1556911220-e15b29be8c8f?auto=format&fit=crop&w=900&q=80',
+  },
+  {
+    title: 'Friday evening',
+    caption: 'Bread on the table. Nobody had left yet.',
+    url: 'https://images.unsplash.com/photo-1504674900247-0877df9cc836?auto=format&fit=crop&w=900&q=80',
+  },
 ];
 
 const PERSONALITY = {
@@ -652,31 +685,28 @@ await insert('legacy_values', VALUES);
 await insert('legacy_wisdom', WISDOM);
 await insert('legacy_threads', THREADS.map((t) => ({ ...t, status: 'open' })));
 
-/* Photographs — copy an image already in the bucket so every row resolves to a
-   real file and the owner can delete rows without breaking the others. */
-const { data: files, error: listErr } = await supabase.storage
-  .from(BUCKET)
-  .list(creatorId, { limit: 200 });
-if (listErr) throw listErr;
+/* Photographs — download distinct test images so the collage is not one portrait copied. */
+async function uploadSeedPhoto(i, item) {
+  const to = `${creatorId}/seed-gallery-${i + 1}.jpg`
+  const res = await fetch(item.url, { headers: { Accept: 'image/*' } })
+  if (!res.ok) throw new Error(`Could not download photo ${i + 1}: ${res.status}`)
+  const buf = Buffer.from(await res.arrayBuffer())
+  const contentType = (res.headers.get('content-type') || 'image/jpeg').split(';')[0]
+  await supabase.storage.from(BUCKET).remove([to])
+  const { error } = await supabase.storage.from(BUCKET).upload(to, buf, {
+    contentType: contentType.includes('png') ? 'image/png' : 'image/jpeg',
+    upsert: true,
+  })
+  if (error) throw new Error(`storage upload ${to}: ${error.message}`)
+  return { title: item.title, caption: item.caption, image_path: to }
+}
 
-const sources = (files || [])
-  .filter((f) => /\.(png|jpe?g|webp)$/i.test(f.name) && !f.name.startsWith('seed-'))
-  .map((f) => `${creatorId}/${f.name}`);
-
-if (sources.length === 0) {
-  console.log('  legacy_gallery_items: skipped (no image in storage to copy)');
-} else {
-  const rows = [];
+{
+  const rows = []
   for (let i = 0; i < GALLERY.length; i++) {
-    const from = sources[i % sources.length];
-    const ext = from.split('.').pop().toLowerCase();
-    const to = `${creatorId}/seed-gallery-${i + 1}.${ext}`;
-    await supabase.storage.from(BUCKET).remove([to]);
-    const { error } = await supabase.storage.from(BUCKET).copy(from, to);
-    if (error) throw new Error(`storage copy ${to}: ${error.message}`);
-    rows.push({ ...GALLERY[i], image_path: to });
+    rows.push(await uploadSeedPhoto(i, GALLERY[i]))
   }
-  await insert('legacy_gallery_items', rows);
+  await insert('legacy_gallery_items', rows)
 }
 
 /* Coverage — upsert so hand-made scores for other categories survive. */
