@@ -410,18 +410,38 @@ router.get('/assets', async (req, res) => {
   }
 });
 
-/** POST /api/avatar/identity — save explicit gender/pronouns (never inferred from name). */
+/** POST /api/avatar/identity — save name and/or explicit gender/pronouns (never inferred from name). */
 router.post('/identity', async (req, res) => {
   try {
     const creator = await getOwnedCreator(req);
     if (!creator) return res.status(404).json({ error: 'No creator profile yet' });
-    const { gender, pronouns } = req.body || {};
-    const saved = await saveCreatorIdentity(req.supabase, creator.id, { gender, pronouns });
+    const { gender, pronouns, displayName } = req.body || {};
+
+    let name = creator.display_name || null;
+    if (typeof displayName === 'string') {
+      const trimmed = displayName.trim().slice(0, 80);
+      if (!trimmed) return res.status(400).json({ error: 'Enter a name for your archive.' });
+      const { error } = await req.supabase
+        .from('legacy_creators')
+        .update({ display_name: trimmed, updated_at: new Date().toISOString() })
+        .eq('id', creator.id);
+      if (error) throw new Error(error.message);
+      name = trimmed;
+    }
+
+    let saved = { gender: null, pronouns: null };
+    if (gender !== undefined || pronouns !== undefined) {
+      saved = await saveCreatorIdentity(req.supabase, creator.id, { gender, pronouns });
+    } else {
+      const identity = await loadCreatorIdentity(req.supabase, creator.id);
+      saved = { gender: identity.gender, pronouns: identity.pronouns };
+    }
+
     res.json({
       success: true,
       gender: saved.gender,
       pronouns: saved.pronouns,
-      displayName: creator.display_name || null,
+      displayName: name,
     });
   } catch (e) {
     res.status(500).json({ error: e.message });

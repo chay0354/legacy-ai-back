@@ -28,6 +28,8 @@ function corsOrigins() {
 function isAllowedOrigin(origin, allowed) {
   if (!origin) return true;
   if (allowed.includes(origin)) return true;
+  // Vite may bind 5174+ when 5173 is already taken.
+  if (/^https?:\/\/(localhost|127\.0\.0\.1)(:\d+)?$/.test(origin)) return true;
   return /^https:\/\/[\w.-]+\.vercel\.app$/.test(origin);
 }
 
