@@ -135,10 +135,11 @@ async function assertInterviewCreator(req) {
   return memberships;
 }
 
-/** When no creatorId is passed, family viewers land on a shared legacy — not a new empty one. */
+/** When no creatorId is passed, owners stay on their own legacy. Family-only viewers land on a shared one. */
 async function defaultCreatorIdForProfile(req, requestedCreatorId) {
   if (requestedCreatorId) return requestedCreatorId;
   const memberships = await accessStore(req).listMembershipsForUser(req.user.id);
+  if (memberships.some((m) => m.is_owner)) return null;
   const shared = memberships.filter((m) => !m.is_owner);
   if (shared.length > 0) return shared[0].creator_id;
   return null;
