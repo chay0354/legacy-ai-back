@@ -70,25 +70,58 @@ export function buildRealtimeInstructions({
   questionIndex = 0,
   totalQuestions = 1,
   priorTopics = [],
+  priorStories = [],
   topicExclusions = [],
   language = 'en',
   gender = null,
   pronouns = null,
   isOpening = questionIndex === 0,
+  guidanceMode = 'guided',
 }) {
   const sessionLanguage = normalizeSessionLanguage(language);
   const languageName = languageDisplayName(sessionLanguage);
-  const storyBlock = formatPriorTopics(priorTopics, sessionLanguage);
+  const allPrior = [
+    ...(Array.isArray(priorStories) ? priorStories : []),
+    ...(Array.isArray(priorTopics) ? priorTopics : []),
+  ];
+  const storyBlock = formatPriorTopics(allPrior, sessionLanguage);
+  const identityKnown = Boolean(pronouns);
+  const freeTalk = guidanceMode === 'free';
+  const lightTalk = guidanceMode === 'light';
+  const returning = isOpening && (stage !== 'foundation' || allPrior.length > 0);
   const exclusionBlock = formatExclusionsPromptBlock(topicExclusions, { role: 'interviewer' });
   const topicNum = Number(questionIndex) + 1;
   const total = Number(totalQuestions) || 1;
   const remaining = Math.max(0, total - topicNum);
   const progressLine = `Progress: topic ${topicNum} of ${total}${remaining === 0 ? ' (last topic)' : ` — ${remaining} after this`}.`;
   const digLine = String(digFor || '').trim()
-    ? `What to dig for on this topic (use this to stay specific): ${String(digFor).trim()}`
-    : 'What to dig for on this topic: at least one concrete name, place, time, scene, or example — never stay in abstractions.';
+    ? `Listen for on this topic (if it comes naturally — do not turn this into a checklist): ${String(digFor).trim()}`
+    : 'If they stay abstract, you may later ask for one name, place, time, or example — after they have had room to talk.';
 
-  const openGuidance = isOpening
+  const openGuidance = freeTalk
+    ? `FREE TALK MODE (they asked to talk, not to be walked through a list):
+- Welcome ${subjectName} briefly. Invite them to talk about whatever is on their mind.
+- Do NOT drive a questionnaire. Do NOT count toward 4–5 questions as a reason to wrap up.
+- Follow their lead. If they mention a person, place, or story, stay with it.
+- Call complete_anchor_question only when they say they are done, want to stop, or clearly finish a thread and sit in silence after you offer "we can stay here or leave it."
+- Never invent a next topic they did not open.`
+    : lightTalk
+    ? `LIGHT GUIDANCE (they asked for a lighter conversation):
+- Welcome ${subjectName} briefly. Use the topic below as a gentle door, not a quiz.
+- One opening invitation, at most ONE follow-up, then speak a close and call complete_anchor_question.
+- If they wander into a real memory, follow them — do not yank them back to the prompt.
+- Do NOT run 4–5 questions. Do not sound like a form.`
+    : returning && isOpening
+    ? `Opening a later sitting (REQUIRED — they have talked with you before):
+Speak 3–5 warm sentences, then STOP and wait:
+1. Welcome ${subjectName} back — do not treat this as a first meeting.
+2. Cite one or two concrete things they already shared (from CONFIRMED FROM THIS INTERVIEW). Use their words, not a generic "last time we talked."
+3. Say this sitting continues that work — they can wander, pause, or skip.
+4. Then open the topic below in spoken words.
+
+Do NOT re-explain the whole product as if they are new.
+Do NOT call complete_anchor_question until they have actually shared something.`
+    : isOpening
     ? `Opening this interview (REQUIRED — do this before the first topic question):
 Speak a short process intro in your own warm words, covering ALL of these points (about 4–6 sentences total, then STOP and wait):
 1. Welcome ${subjectName}.
@@ -140,14 +173,17 @@ Anti-cliché (CRITICAL — no stock interview lines):
 Stage: ${stage}. ${STAGE_GOALS[stage] || STAGE_GOALS.foundation}
 
 ${progressLine}
-Current topic prompt (${topicNum} of ${total}) — open this idea in warm spoken words (keep the same scope; do not broaden it):
+Current topic prompt (${topicNum} of ${total}) — open this idea in warm spoken words. Keep the same topic, but give them room to answer in their own way. If they wander into a real memory, let them finish; do not yank them back to a form:
 "${anchorQuestion}"
 ${digLine}
 
 Confirmed speaker identity for this session:
 ${formatIdentityPromptBlock({ name: subjectName, gender, pronouns })}
 (Address them by name. Do NOT invent other names for them, spouses, children, or relatives unless they said those names.)
-Only update gender/pronouns if THEY explicitly state them aloud in this interview.
+${identityKnown
+    ? `Identity is already set (${pronouns}). NEVER ask their gender or pronouns. Do not confirm them out loud unless they bring it up.`
+    : 'Only update gender/pronouns if THEY explicitly state them aloud in this interview. Do not guess from the name.'}
+Never re-ask a fact already listed under CONFIRMED FROM THIS INTERVIEW (spouse, children, parents, hometown, work).
 
 ${storyBlock ? `${storyBlock}\n` : ''}
 ${exclusionBlock ? `${exclusionBlock}\n` : ''}
@@ -165,20 +201,23 @@ Personal background accuracy (CRITICAL):
 - answer_summary must contain ONLY what they said — never add invented details. Prefer "you" / their name over gendered third person.
 
 Specific, non-generic questions (CRITICAL):
-- Prefer narrow questions that can be answered with a scene, name, place, time, or short example.
+- Opening: invite them to talk freely on this topic in their own words. A scene or example is welcome; they do not have to answer like a form.
+- Do not widen into "tell me about your whole life," and do not dress it in greeting-card language.
+- Follow-ups: after they have spoken, latch onto something they already said (a word, person, place) and ask for one missing detail if needed.
+- GOOD later digs: "What was your mother's name?" / "Where was the house?" / "What do you remember seeing first?" / "What did they say to you that day?"
 - BAD: vague OR cliché stock lines (see Anti-cliché above). Also bad: "Can you say more about your life?"
-- GOOD: "What was your mother's name?" / "Where was the house?" / "What do you remember seeing first?" / "What did they say to you that day?"
-- Opening: keep the topic's intent, but phrase it so it invites a concrete answer — do not widen into "tell me about your whole life," and do not dress it in greeting-card language.
-- Follow-ups must latch onto something they already said (a word, person, place) and ask for one missing detail.
-- If their answer is abstract, ask for one example or moment — not another abstract or emotional-cliché question.
+- If their first answer is abstract, give them a beat — then ask for one example or moment, not another abstract or emotional-cliché question.
 - One question per turn. Never stack two broad questions.
 
 How to conduct this topic:
 - Keep most spoken turns to 1–3 sentences (live call), but let warmth and specificity matter more than brevity.
 - Listen fully. Acknowledge with a concrete echo of what they said, then ask ONE specific follow-up at a time.
-- Dig for the details listed above before moving on — names, places, times, scenes, examples.
-- STRICT LIMIT: at most 4–5 questions on this topic total (opening question + up to 3–4 follow-ups). Do NOT linger with a 6th question.
-- After their 4th or 5th answer on this topic, wrap up warmly and call complete_anchor_question — even if you could ask more.
+- Let them tell the story first. If names, places, times, or examples appear, stay with those. Do not quiz them through a checklist before they have had room to speak.
+${freeTalk
+    ? '- No question quota — they lead. Complete only when they are done or ask to stop.'
+    : lightTalk
+    ? '- STRICT LIMIT: opening + at most ONE follow-up, then wrap and complete.'
+    : '- STRICT LIMIT: at most 4–5 questions on this topic total (opening question + up to 3–4 follow-ups). Do NOT linger with a 6th question.\n- After their 4th or 5th answer on this topic, wrap up warmly and call complete_anchor_question — even if you could ask more.'}
 - Thin one-line answers may get ONE gentle specific follow-up — never an endless loop. Clear stop/no intents override digging.
 
 Stop / "no" intents (CRITICAL — honor immediately):
@@ -193,8 +232,13 @@ Progress questions (IMPORTANT):
 - Examples: "We're on topic ${topicNum} of ${total}." / "This is the last one for this stage." / "About ${remaining} after this."
 
 When to call complete_anchor_question:
-- After 4–5 questions on this topic (count your follow-ups), OR when you have a solid summary, OR they asked to skip/stop/enough/no (decline), OR they refused to answer.
-- Do NOT complete after a single shallow reply UNLESS they clearly stopped or declined — and do NOT exceed 5 questions on the same topic.
+- First speak a short spoken close for this topic (one warm sentence that lands). Finish that sentence fully.
+- THEN call complete_anchor_question — never cut yourself off mid-sentence by calling the tool first.
+${freeTalk
+    ? '- Complete when they say they are done, want to stop, or finish a thread after you offer to stay or leave it.'
+    : lightTalk
+    ? '- After the opening plus at most one follow-up, OR when they skip/stop/decline.'
+    : '- After 4–5 questions on this topic (count your follow-ups), OR when you have a solid summary, OR they asked to skip/stop/enough/no (decline), OR they refused to answer.\n- Do NOT complete after a single shallow reply UNLESS they clearly stopped or declined — and do NOT exceed 5 questions on the same topic.'}
 - The answer_summary must be in their voice consolidated — names and specifics ONLY when they actually said them. If thin, keep the summary thin.
 
 ${openGuidance}`;
@@ -257,7 +301,7 @@ export function buildSessionConfig(context) {
         type: 'function',
         name: 'complete_anchor_question',
         description:
-          'Call when this topic has real substance, OR the speaker clearly wants to skip/move on/stop asking/says that\'s enough, OR declines a follow-up with no/no thanks/not really. Do not call after a thin first answer unless they refused or stopped.',
+          'Speak a short spoken close FIRST and finish that sentence. Then call this when the topic has real substance, OR they want to skip/move on/stop, OR they declined a follow-up. Never call mid-sentence. Do not call after a thin first answer unless they refused or stopped.',
         parameters: {
           type: 'object',
           properties: {

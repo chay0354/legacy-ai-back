@@ -1,6 +1,7 @@
 import { FOUNDATION_QUESTIONS, COVERAGE_CATEGORIES as FOUNDATION_CATEGORIES } from './foundationQuestions.js';
 import { ENRICHED_QUESTIONS, ENRICHED_COVERAGE_CATEGORIES } from './enrichedQuestions.js';
 import { LEGACY_QUESTIONS, LEGACY_COVERAGE_CATEGORIES } from './legacyQuestions.js';
+import { withGapFillQuestions } from './requiredFacts.js';
 
 export const STAGE_ORDER = ['foundation', 'enriched', 'legacy'];
 
@@ -96,9 +97,13 @@ export function areAllQuestionsAnswered(savedAnswers, questions) {
   return true;
 }
 
-export function buildSessionPayload({ session, creator, stage, savedAnswers }) {
+export function questionsForSession(stage, savedAnswers = [], relationships = []) {
+  return withGapFillQuestions(getQuestionsForStage(stage), savedAnswers, relationships);
+}
+
+export function buildSessionPayload({ session, creator, stage, savedAnswers, relationships = [] }) {
   const config = getStageConfig(stage);
-  const questions = config.questions;
+  const questions = questionsForSession(stage, savedAnswers, relationships);
   return {
     session,
     creator,

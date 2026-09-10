@@ -26,7 +26,8 @@ You manage ONE anchor question at a time. You:
 - Ask ONE specific follow-up at a time when the anchor needs depth
 - Never ask vague or cliché prompts: "Tell me more", "How did that make you feel?", "What was that like?", "What comes up for you?", "Anything else?", "Can you unpack that?"
 - Prefer concrete digs tied to their words: a name, place, time, what they saw, what someone said, one short example
-- Keep the topic's scope — do not broaden into "tell me about your whole life" or greeting-card openers
+- Keep the topic, but let them answer in their own shape — if they wander into a real memory, stay with it
+- Do not broaden into "tell me about your whole life" or greeting-card openers, and do not treat the prompt like a form to complete
 - Use brief transitions only when moving to the next topic
 - Personal background: ONLY use facts they explicitly said. Never invent or assume hometown, age, spouse/kids/parents, jobs, religion, dates, places, or feelings. Pronouns: follow the identity block strictly; if UNKNOWN never use he/him or she/her. Prefer "you" / their name. If vague, ask for one concrete detail — do not guess or fill gaps to sound warmer.
 - Exclusions: If they say don't talk about / prefer not to discuss a subject, honor it — never ask about it again. If that subject IS the current anchor, set advance:true with a short answerSummary noting they asked to leave it alone.
@@ -59,21 +60,33 @@ function buildUserMessage({
   userTranscript,
   isOpening,
   topicExclusions = [],
+  priorTopics = [],
 }) {
   const history = (turns || [])
     .map((t) => `${t.role === 'assistant' ? 'You' : subjectName}: ${t.text}`)
     .join('\n');
   const exclusionBlock = formatExclusionsPromptBlock(topicExclusions, { role: 'interviewer' });
   const digLine = String(digFor || '').trim()
-    ? `Dig for: ${String(digFor).trim()}`
-    : 'Dig for one concrete name, place, time, scene, or example.';
+    ? `Listen for (do not quiz): ${String(digFor).trim()}`
+    : 'If they stay thin, you may later ask for one name, place, time, or example.';
+
+  const prior = (priorTopics || [])
+    .filter((t) => t && (t.summary || t.answer))
+    .slice(0, 8)
+    .map((t, i) => `${i + 1}. ${t.question || t.module || 'Earlier'} — ${String(t.summary || t.answer).trim().slice(0, 220)}`)
+    .join('\n');
+  const priorBlock = prior
+    ? `They already shared (cite if this is a later sitting; do not re-ask):\n${prior}\n\n`
+    : '';
 
   if (isOpening) {
     return `Start the ${stage} interview. Anchor question ${questionIndex + 1} of ${totalQuestions}:
 "${anchorQuestion}"
 ${digLine}
 
-${exclusionBlock ? `${exclusionBlock}\n\n` : ''}Greet ${subjectName} briefly (one sentence), then ask this topic in warm spoken words that invite a concrete answer (do not broaden it).
+${priorBlock}${exclusionBlock ? `${exclusionBlock}\n\n` : ''}${prior
+    ? `Welcome ${subjectName} back and mention one thing they already shared, then open this topic.`
+    : `Greet ${subjectName} briefly (one sentence), then ask this topic in warm spoken words that leave them room to talk in their own way (keep the topic; do not turn it into a form).`}
 Do NOT advance. answerSummary must be empty string.`;
   }
 

@@ -45,13 +45,10 @@ export async function isInstantCloneLikelyAvailable() {
 
 export function markInstantCloneUnavailable(err) {
   const code = err?.code;
-  const msg = String(err?.message || '');
-  if (
-    code === 'paid_plan_required'
-    || code === 'can_not_use_instant_voice_cloning'
-    || /instant voice cloning/i.test(msg)
-    || /paid_plan_required/i.test(msg)
-  ) {
+  // Only lock the process on a real plan/quota denial — never on sample-quality
+  // errors (those messages also mention "instant voice cloning" and used to
+  // disable cloning for every later user until the server restarted).
+  if (code === 'paid_plan_required' || code === 'can_not_use_instant_voice_cloning') {
     instantCloneAvailable = false;
   }
 }
@@ -70,7 +67,11 @@ export async function cloneVoice({ name, sample, samples, description }) {
   const form = new FormData();
   form.append('name', name);
   if (description) form.append('description', description);
-  form.append('remove_background_noise', 'true');
+  // Studio recordings are already in a quiet room. Isolation can make a clean
+  // sample worse (ElevenLabs docs) and sometimes fail the clone.
+  if (process.env.ELEVENLABS_REMOVE_BACKGROUND_NOISE === 'true') {
+    form.append('remove_background_noise', 'true');
+  }
 
   const allSamples = samples?.length ? samples : sample ? [sample] : [];
   if (!allSamples.length) throw new Error('At least one voice sample is required');

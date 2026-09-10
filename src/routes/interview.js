@@ -31,9 +31,9 @@ import { loadCreatorIdentity, resolveIdentity } from '../services/genderProfile.
 import { makeAccessStore } from '../db/accessRepo.js';
 import {
   resolveInterviewStage,
-  getQuestionsForStage,
   getStageConfig,
   buildSessionPayload,
+  questionsForSession,
   nextStage,
   areAllQuestionsAnswered,
   stageCompleteLevel,
@@ -281,9 +281,30 @@ async function resolveStageSessionSupabase(supabase, creator, requestedStage) {
   return { allComplete: true };
 }
 
+async function loadRelationships(req, creatorId, usePg) {
+  try {
+    if (usePg) {
+      const db = getPool();
+      const { rows } = await db.query(
+        `SELECT name, relationship_type FROM legacy_relationships WHERE creator_id = $1 LIMIT 40`,
+        [creatorId],
+      );
+      return rows || [];
+    }
+    const { data } = await req.supabase
+      .from('legacy_relationships')
+      .select('name, relationship_type')
+      .eq('creator_id', creatorId)
+      .limit(40);
+    return data || [];
+  } catch {
+    return [];
+  }
+}
+
 /** If every topic is saved but status never left in_progress, mark finished so refresh won't reopen it. */
-async function selfHealFullyAnsweredSession(req, { usePg, creator, stage, session, savedAnswers }) {
-  const questions = getQuestionsForStage(stage);
+async function selfHealFullyAnsweredSession(req, { usePg, creator, stage, session, savedAnswers, relationships = [] }) {
+  const questions = questionsForSession(stage, savedAnswers, relationships);
   if (session.status !== 'in_progress') return null;
   if (!areAllQuestionsAnswered(savedAnswers, questions)) return null;
 
@@ -311,15 +332,76 @@ async function selfHealFullyAnsweredSession(req, { usePg, creator, stage, sessio
 async function loadSessionMeta(supabase, pgMode, sessionId) {
   if (pgMode) {
     const db = getPool();
-    const { rows } = await db.query('SELECT stage FROM legacy_interview_sessions WHERE id = $1', [sessionId]);
+    const { rows } = await db.query(
+      'SELECT stage, creator_id FROM legacy_interview_sessions WHERE id = $1',
+      [sessionId],
+    );
     return rows[0] || null;
   }
   const { data } = await supabase
     .from('legacy_interview_sessions')
-    .select('stage')
+    .select('stage, creator_id')
     .eq('id', sessionId)
     .maybeSingle();
   return data;
+}
+
+const STAGE_SEQ = ['foundation', 'enriched', 'legacy'];
+
+function normalizeGuidanceMode(mode) {
+  if (mode === 'free' || mode === 'light') return mode;
+  return 'guided';
+}
+
+async function loadPriorStories(req, creatorId, currentStage, usePg, excludeSessionId) {
+  if (!creatorId) return [];
+  const stageIdx = STAGE_SEQ.indexOf(currentStage);
+  const stages = stageIdx < 0 ? [currentStage] : STAGE_SEQ.slice(0, stageIdx + 1);
+  try {
+    if (usePg) {
+      const db = getPool();
+      const { rows: sessions } = await db.query(
+        `SELECT id FROM legacy_interview_sessions
+         WHERE creator_id = $1 AND stage = ANY($2::text[])
+           AND status IN ('completed', 'processed')
+           AND ($3::uuid IS NULL OR id <> $3::uuid)
+         ORDER BY created_at ASC`,
+        [creatorId, stages, excludeSessionId || null],
+      );
+      const out = [];
+      for (const s of sessions) {
+        const answers = await getAnswersPg(s.id);
+        for (const a of answers) {
+          if (a.skipped || !String(a.answer || '').trim()) continue;
+          out.push({ question: a.question, summary: String(a.answer).trim() });
+        }
+      }
+      return out.slice(0, 16);
+    }
+    let query = req.supabase
+      .from('legacy_interview_sessions')
+      .select('id')
+      .eq('creator_id', creatorId)
+      .in('stage', stages)
+      .in('status', ['completed', 'processed']);
+    if (excludeSessionId) query = query.neq('id', excludeSessionId);
+    const { data: sessions } = await query;
+    const out = [];
+    for (const s of sessions || []) {
+      const { data: answers } = await req.supabase
+        .from('legacy_interview_answers')
+        .select('question, answer, skipped')
+        .eq('session_id', s.id)
+        .order('question_index');
+      for (const a of answers || []) {
+        if (a.skipped || !String(a.answer || '').trim()) continue;
+        out.push({ question: a.question, summary: String(a.answer).trim() });
+      }
+    }
+    return out.slice(0, 16);
+  } catch {
+    return [];
+  }
 }
 
 /** GET /api/interview/session[?stage=foundation|enriched|legacy] */
@@ -345,6 +427,7 @@ router.get('/session', async (req, res) => {
 
       let { stage, session } = resolved;
       let savedAnswers = await getAnswersPg(session.id);
+      const relationships = await loadRelationships(req, creator.id, true);
 
       const healed = await selfHealFullyAnsweredSession(req, {
         usePg: true,
@@ -352,6 +435,7 @@ router.get('/session', async (req, res) => {
         stage,
         session,
         savedAnswers,
+        relationships,
       });
       if (healed?.allComplete) {
         creator = await getOrCreateCreatorPg(req.user.id, displayName(req.user));
@@ -369,8 +453,10 @@ router.get('/session', async (req, res) => {
         savedAnswers = await getAnswersPg(session.id);
       }
 
+      const priorStories = await loadPriorStories(req, creator.id, stage, true, session?.id);
       return res.json({
-        ...buildSessionPayload({ session, creator, stage, savedAnswers }),
+        ...buildSessionPayload({ session, creator, stage, savedAnswers, relationships }),
+        priorStories,
         topicExclusions: [],
         dbMode: 'postgres',
       });
@@ -396,6 +482,7 @@ router.get('/session', async (req, res) => {
       .eq('session_id', session.id)
       .order('question_index');
     savedAnswers = savedAnswers || [];
+    const relationships = await loadRelationships(req, creator.id, false);
 
     const healed = await selfHealFullyAnsweredSession(req, {
       usePg: false,
@@ -403,6 +490,7 @@ router.get('/session', async (req, res) => {
       stage,
       session,
       savedAnswers,
+      relationships,
     });
     if (healed?.allComplete) {
       creator = await getOrCreateCreatorSupabase(req.supabase, req.user);
@@ -426,8 +514,10 @@ router.get('/session', async (req, res) => {
     }
 
     const topicExclusions = await loadTopicExclusionsSupabase(req.supabase, creator.id);
+    const priorStories = await loadPriorStories(req, creator.id, stage, false, session?.id);
     res.json({
-      ...buildSessionPayload({ session, creator, stage, savedAnswers }),
+      ...buildSessionPayload({ session, creator, stage, savedAnswers, relationships }),
+      priorStories,
       topicExclusions,
       dbMode: 'supabase',
     });
@@ -449,7 +539,29 @@ router.put('/session/:sessionId/answer', async (req, res) => {
     const usePg = !!getPool();
     const sessionMeta = await loadSessionMeta(req.supabase, usePg, sessionId);
     const stage = sessionMeta?.stage || 'foundation';
-    const questions = getQuestionsForStage(stage);
+    const creatorId = sessionMeta?.creator_id;
+    let savedAnswers = [];
+    if (usePg) {
+      savedAnswers = await getAnswersPg(sessionId);
+    } else {
+      const listed = await req.supabase
+        .from('legacy_interview_answers')
+        .select('*')
+        .eq('session_id', sessionId)
+        .order('question_index');
+      savedAnswers = listed.data || [];
+    }
+    const mergedAnswers = [
+      ...savedAnswers.filter((a) => (a.question_index ?? a.questionIndex) !== questionIndex),
+      {
+        question_index: questionIndex,
+        question,
+        answer: answer || '',
+        skipped: skipped ?? false,
+      },
+    ];
+    const relationships = creatorId ? await loadRelationships(req, creatorId, usePg) : [];
+    const questions = questionsForSession(stage, mergedAnswers, relationships);
     const meta = questions[questionIndex] || {};
 
     if (usePg) {
@@ -462,7 +574,10 @@ router.put('/session/:sessionId/answer', async (req, res) => {
         mode: mode || 'text',
         skipped: skipped ?? false,
       });
-      return res.json({ answer: data });
+      return res.json({
+        answer: data,
+        questions: questions.map((q) => ({ q: q.q, digFor: q.digFor || '' })),
+      });
     }
 
     const { data, error } = await req.supabase
@@ -484,7 +599,10 @@ router.put('/session/:sessionId/answer', async (req, res) => {
       .single();
 
     if (error) throw error;
-    res.json({ answer: data });
+    res.json({
+      answer: data,
+      questions: questions.map((q) => ({ q: q.q, digFor: q.digFor || '' })),
+    });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
@@ -500,7 +618,10 @@ router.post('/session/:sessionId/complete', async (req, res) => {
 
     const sessionMeta = await loadSessionMeta(req.supabase, usePg, sessionId);
     const stage = sessionMeta?.stage || 'foundation';
-    const questions = getQuestionsForStage(stage);
+    const relationships = sessionMeta?.creator_id
+      ? await loadRelationships(req, sessionMeta.creator_id, usePg)
+      : [];
+    const questions = questionsForSession(stage, answers || [], relationships);
 
     if (answers?.length) {
       for (const a of answers) {
@@ -928,8 +1049,10 @@ router.post('/voice/realtime/token', async (req, res) => {
       questionIndex = 0,
       totalQuestions = 1,
       priorTopics = [],
+      priorStories = [],
       topicExclusions = [],
       language = 'en',
+      guidanceMode = 'guided',
     } = req.body || {};
 
     if (!anchorQuestion) return res.status(400).json({ error: 'anchorQuestion required' });
@@ -944,11 +1067,13 @@ router.post('/voice/realtime/token', async (req, res) => {
       questionIndex,
       totalQuestions,
       priorTopics,
+      priorStories,
       topicExclusions: normalizeExclusions(topicExclusions),
       language: normalizeSessionLanguage(language),
       gender: identity.gender,
       pronouns: identity.pronouns,
       isOpening: Number(questionIndex) === 0,
+      guidanceMode: normalizeGuidanceMode(guidanceMode),
     });
 
     res.json(secret);
@@ -973,8 +1098,10 @@ router.post('/voice/realtime/session', async (req, res) => {
       questionIndex = 0,
       totalQuestions = 1,
       priorTopics = [],
+      priorStories = [],
       topicExclusions = [],
       language = 'en',
+      guidanceMode = 'guided',
     } = req.body || {};
 
     if (typeof sdp !== 'string' || !sdp.trim()) return res.status(400).json({ error: 'sdp required' });
@@ -993,11 +1120,13 @@ router.post('/voice/realtime/session', async (req, res) => {
       questionIndex,
       totalQuestions,
       priorTopics,
+      priorStories,
       topicExclusions: normalizeExclusions(topicExclusions),
       language: normalizeSessionLanguage(language),
       gender: identity.gender,
       pronouns: identity.pronouns,
       isOpening: Number(questionIndex) === 0,
+      guidanceMode: normalizeGuidanceMode(guidanceMode),
     });
 
     res.type('application/sdp').send(answerSdp);
@@ -1018,8 +1147,10 @@ router.post('/voice/realtime/instructions', async (req, res) => {
       questionIndex = 0,
       totalQuestions = 1,
       priorTopics = [],
+      priorStories = [],
       topicExclusions = [],
       language = 'en',
+      guidanceMode = 'guided',
     } = req.body || {};
 
     if (!anchorQuestion) return res.status(400).json({ error: 'anchorQuestion required' });
@@ -1035,11 +1166,13 @@ router.post('/voice/realtime/instructions', async (req, res) => {
         questionIndex,
         totalQuestions,
         priorTopics,
+        priorStories,
         topicExclusions: normalizeExclusions(topicExclusions),
         language: normalizeSessionLanguage(language),
         gender: identity.gender,
         pronouns: identity.pronouns,
         isOpening: Number(questionIndex) === 0,
+        guidanceMode: normalizeGuidanceMode(guidanceMode),
       }),
     });
   } catch (err) {

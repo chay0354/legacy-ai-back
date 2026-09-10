@@ -135,19 +135,74 @@ export async function createAvatarFromImageUrl({ displayName, imageUrl }) {
   return id;
 }
 
-/** Clone a voice from an audio sample buffer (multipart). Returns the voice id. */
-export async function cloneVoice({ name, buffer, contentType = 'audio/wav', filename = 'voice-sample.wav', language = 'en' }) {
-  const form = new FormData();
-  form.append('name', name.slice(0, 50));
-  form.append('language', language || 'en');
-  form.append('audioFile', new Blob([buffer], { type: contentType }), filename);
+const ANAM_INLINE_VOICE_MAX_BYTES = 3_500_000;
+
+async function cloneVoiceViaPresigned({ name, buffer, contentType, filename, language }) {
+  const signed = await fetch(`${BASE_URL}/v1/voices/presigned-upload`, {
+    method: 'POST',
+    headers: {
+      Authorization: `Bearer ${apiKey()}`,
+      'Content-Type': 'application/json',
+      Accept: 'application/json',
+    },
+    body: JSON.stringify({
+      filename,
+      contentType,
+      fileSize: buffer.length,
+    }),
+  });
+  const upload = await parse(signed, 'voice presigned upload');
+  const uploadUrl = upload?.uploadUrl;
+  const audioKey = upload?.audioKey;
+  if (!uploadUrl || !audioKey) throw new Error('Anam did not return a voice upload URL');
+
+  const put = await fetch(uploadUrl, {
+    method: 'PUT',
+    headers: { 'Content-Type': contentType },
+    body: buffer,
+  });
+  if (!put.ok) {
+    const text = await put.text().catch(() => '');
+    throw new Error(`Anam voice upload failed (${put.status}): ${text || put.statusText}`);
+  }
 
   const res = await fetch(`${BASE_URL}/v1/voices`, {
     method: 'POST',
-    headers: { Authorization: `Bearer ${apiKey()}` },
-    body: form,
+    headers: {
+      Authorization: `Bearer ${apiKey()}`,
+      'Content-Type': 'application/json',
+      Accept: 'application/json',
+    },
+    body: JSON.stringify({
+      name: name.slice(0, 50),
+      audioKey,
+      language: language || 'en',
+      enhance: true,
+    }),
   });
-  const data = await parse(res, 'create voice');
+  return parse(res, 'create voice');
+}
+
+/** Clone a voice from an audio sample. Large clips use Anam's presigned upload (~4.5MB multipart limit). */
+export async function cloneVoice({ name, buffer, contentType = 'audio/wav', filename = 'voice-sample.wav', language = 'en' }) {
+  const bytes = Buffer.isBuffer(buffer) ? buffer.length : buffer.byteLength;
+  let data;
+  if (bytes > ANAM_INLINE_VOICE_MAX_BYTES) {
+    data = await cloneVoiceViaPresigned({ name, buffer, contentType, filename, language });
+  } else {
+    const form = new FormData();
+    form.append('name', name.slice(0, 50));
+    form.append('language', language || 'en');
+    form.append('enhance', 'true');
+    form.append('audioFile', new Blob([buffer], { type: contentType }), filename);
+
+    const res = await fetch(`${BASE_URL}/v1/voices`, {
+      method: 'POST',
+      headers: { Authorization: `Bearer ${apiKey()}` },
+      body: form,
+    });
+    data = await parse(res, 'create voice');
+  }
   const id = data?.id;
   if (!id) throw new Error('Anam did not return a voice id');
   return id;

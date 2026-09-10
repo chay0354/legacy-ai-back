@@ -21,6 +21,7 @@ import {
   loadCreatorIdentity,
   saveCreatorIdentity,
 } from '../services/genderProfile.js';
+import { assertVoiceSampleLongEnough } from '../services/audioDuration.js';
 
 const router = Router();
 const BUCKET = 'legacy-media';
@@ -459,28 +460,13 @@ function resolveElevenLabsVoiceId(assets) {
   return assets.metadata?.elevenlabs_voice_id || null;
 }
 
-/** Collect the primary sample plus any older voice-sample files for richer cloning. */
-async function gatherVoiceSamples(req, creatorId, primaryPath, primaryBuffer, primaryFile) {
-  const samples = [{
+/** Use only the recording the creator just submitted. Older takes mix poorly. */
+function voiceSampleForClone(primaryPath, primaryBuffer, primaryFile) {
+  return [{
     buffer: primaryBuffer,
     filename: primaryPath.split('/').pop() || 'voice-sample.wav',
     contentType: primaryFile.type || 'audio/wav',
   }];
-
-  const { data: list } = await req.supabase.storage.from(BUCKET).list(creatorId, { search: 'voice-sample' });
-  for (const item of (list || []).slice(0, 4)) {
-    const path = `${creatorId}/${item.name}`;
-    if (path === primaryPath) continue;
-    const { data } = await req.supabase.storage.from(BUCKET).download(path);
-    if (!data) continue;
-    samples.push({
-      buffer: Buffer.from(await data.arrayBuffer()),
-      filename: item.name,
-      contentType: data.type || 'audio/wav',
-    });
-  }
-
-  return samples;
 }
 
 async function cloneCreatorVoice({ req, creator, voiceSamplePath, buffer, file }) {
@@ -489,7 +475,7 @@ async function cloneCreatorVoice({ req, creator, voiceSamplePath, buffer, file }
   }
 
   const voiceName = `Legacy — ${creator.display_name || 'Creator'} (${creator.id.slice(0, 8)})`;
-  const samples = await gatherVoiceSamples(req, creator.id, voiceSamplePath, buffer, file);
+  const samples = voiceSampleForClone(voiceSamplePath, buffer, file);
 
   if (!await isInstantCloneLikelyAvailable()) {
     throw new Error('ElevenLabs instant voice cloning is not available on this plan.');
@@ -532,6 +518,15 @@ router.post('/voice-sample', async (req, res) => {
     if (!creator) return res.status(404).json({ error: 'No legacy found for this user' });
 
     const path = voiceSamplePath.trim();
+    const { data: sampleFile, error: sampleErr } = await req.supabase.storage.from(BUCKET).download(path);
+    if (sampleErr || !sampleFile) {
+      return res.status(400).json({ error: `Could not read voice sample: ${sampleErr?.message || 'not found'}` });
+    }
+    try {
+      assertVoiceSampleLongEnough(Buffer.from(await sampleFile.arrayBuffer()));
+    } catch (e) {
+      return res.status(e.status || 400).json({ error: e.message });
+    }
     const existing = await getAssets(req, creator.id);
     const prevMeta = existing?.metadata || {};
     const sampleChanged = existing?.voice_sample_path && existing.voice_sample_path !== path;
@@ -588,6 +583,12 @@ router.post('/voice', async (req, res) => {
     }
 
     const buffer = Buffer.from(await file.arrayBuffer());
+    try {
+      assertVoiceSampleLongEnough(buffer);
+    } catch (e) {
+      await upsertAssets(req, creator.id, { voice_status: 'failed' });
+      return res.status(e.status || 400).json({ error: e.message });
+    }
     const existing = await getAssets(req, creator.id);
     const prevMeta = existing?.metadata || {};
 
@@ -875,8 +876,8 @@ function buildAvatarSystemPrompt(ctx, languageCode = 'en', opts = {}) {
   ).join('\n') || '(none preserved yet)';
 
   const lengthRule = liveMode
-    ? '6. Keep replies VERY SHORT for live video — 1 to 3 spoken sentences MAX. Never monologue, never dump a long story, never use lists. One warm thought, then stop and listen.'
-    : '6. Keep replies SHORT and spoken — 2 to 4 sentences. They will be voiced aloud by your avatar.';
+    ? '6. Keep replies VERY SHORT for live video — 1 to 3 spoken sentences MAX. Never monologue, never dump a long story, never use lists. Answer, then stop and listen. Do NOT end with a question unless they asked you one. If they say "don\'t ask questions" or "just answer", obey for the rest of the call.'
+    : '6. Keep replies SHORT and spoken — 2 to 4 sentences. They will be voiced aloud by your avatar. Answer, then stop. Do not tack on a follow-up question unless they invited one.';
 
   const identityLines = (ctx.identityAnswers || []).map((a) => {
     const label = a.module || a.category || 'Background';
@@ -919,6 +920,7 @@ ${lengthRule}
 9. ${languageReplyHint(languageCode)}
 10. Prefer fewer true words over a richer false story. When unsure, under-claim.
 11. Honor TOPIC EXCLUSIONS below without exception.
+12. Do not close a turn with a question. Statements only, unless they asked you a question and you need one clarifying word. If they said "don't ask questions", never ask again.
 
 ${style}
 ${phrases}
@@ -1063,7 +1065,7 @@ router.post('/live/start', async (req, res) => {
         voiceId: readyVoiceId,
         languageCode,
         systemPrompt,
-        initialMessage: `Hello. It's me — ${ctx.name}. I'm right here. Ask me anything.`,
+        initialMessage: `Hello. It's me — ${ctx.name}. I'm right here.`,
       });
     } catch (e) {
       const msg = String(e.message || '');
