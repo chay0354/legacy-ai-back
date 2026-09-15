@@ -31,15 +31,46 @@ export function publicBilling(row) {
   };
 }
 
+async function refreshBillingFromStripe(req, userId) {
+  if (!stripeConfigured()) return getBillingByUserId(req, userId);
+  try {
+    const existing = await getBillingByUserId(req, userId);
+    const stripe = stripeClient();
+    let customerId = existing?.stripeCustomerId || null;
+    if (!customerId) {
+      const email = req.userEmail || req.user?.email;
+      if (email) {
+        const list = await stripe.customers.list({ email, limit: 15 });
+        const match = list.data.find((c) => c.metadata?.userId === userId) || list.data[0];
+        customerId = match?.id || null;
+      }
+    }
+    if (!customerId) return existing;
+    const sub = await subscriptionForCustomer(customerId);
+    if (!sub) return existing;
+    return persistSubscription(req, {
+      userId,
+      customerId,
+      subscription: sub,
+      checkoutPaid: ['active', 'trialing', 'incomplete'].includes(sub.status),
+    });
+  } catch (e) {
+    console.warn('[billing] stripe refresh failed:', e.message);
+    return getBillingByUserId(req, userId);
+  }
+}
+
 export async function billingForUser(req, userId) {
-  return publicBilling(await getBillingByUserId(req, userId));
+  const row = await getBillingByUserId(req, userId);
+  if (isPaidStatus(row?.status, row?.currentPeriodEnd)) return publicBilling(row);
+  return publicBilling(await refreshBillingFromStripe(req, userId));
 }
 
 export async function ownerIsPaid(req, creatorId) {
   const ownerId = await ownerUserIdForCreator(req, creatorId);
   if (!ownerId) return false;
-  const row = await getBillingByUserId(req, ownerId);
-  return isPaidStatus(row?.status, row?.currentPeriodEnd);
+  const billing = await billingForUser(req, ownerId);
+  return billing.paid;
 }
 
 function paymentError(message) {
@@ -52,11 +83,11 @@ function paymentError(message) {
 /** Owner starting paid work on their own account. */
 export async function assertUserPaid(req) {
   if (!stripeConfigured()) return publicBilling(null);
-  const row = await getBillingByUserId(req, req.user.id);
-  if (!isPaidStatus(row?.status, row?.currentPeriodEnd)) {
+  const billing = await billingForUser(req, req.user.id);
+  if (!billing.paid) {
     throw paymentError('Choose a plan to start the interview, live avatar, and family invitations.');
   }
-  return publicBilling(row);
+  return billing;
 }
 
 /** Paid work billed to the archive owner (live call by family still needs the owner’s plan). */
@@ -155,10 +186,6 @@ export async function applyCheckoutSession(req, session) {
   });
 }
 
-function sleep(ms) {
-  return new Promise((resolve) => setTimeout(resolve, ms));
-}
-
 async function subscriptionForCustomer(customerId) {
   if (!customerId) return null;
   const list = await stripeClient().subscriptions.list({ customer: customerId, limit: 8, status: 'all' });
@@ -167,31 +194,38 @@ async function subscriptionForCustomer(customerId) {
     || null;
 }
 
+function forcedPaid(plan, row, period) {
+  return {
+    plan,
+    status: 'active',
+    paid: true,
+    cancelAtPeriodEnd: false,
+    currentPeriodEnd: row?.currentPeriodEnd || period,
+    maxOwnedArchives: getPlan(plan)?.maxOwnedArchives || 1,
+    source: 'stripe',
+    notes: row?.notes || null,
+    credits: row?.credits || [],
+  };
+}
+
 /**
- * After Checkout redirects back: wait for the subscription, then write paid access.
- * A completed, paid session is enough even if Stripe is still attaching the subscription id.
+ * After Checkout redirects back. One Stripe read — if they paid, the archive opens now.
  */
 export async function syncCheckoutSession(req, sessionId, userId) {
   const stripe = stripeClient();
-  let session = null;
-  for (let attempt = 0; attempt < 6; attempt += 1) {
-    session = await stripe.checkout.sessions.retrieve(sessionId, {
-      expand: ['subscription', 'invoice.subscription'],
-    });
-    if (typeof session.subscription === 'string') {
+  const session = await stripe.checkout.sessions.retrieve(sessionId, {
+    expand: ['subscription'],
+  });
+  if (typeof session.subscription === 'string') {
+    try {
       session.subscription = await stripe.subscriptions.retrieve(session.subscription);
+    } catch (e) {
+      console.warn('[billing] subscription retrieve failed:', e.message);
     }
-    if (!session.subscription && session.invoice?.subscription) {
-      const sub = session.invoice.subscription;
-      session.subscription = typeof sub === 'string' ? await stripe.subscriptions.retrieve(sub) : sub;
-    }
-    if (!session.subscription) {
-      const customerId = typeof session.customer === 'string' ? session.customer : session.customer?.id;
-      const found = await subscriptionForCustomer(customerId);
-      if (found) session.subscription = found;
-    }
-    if (session.subscription || checkoutLooksPaid(session)) break;
-    await sleep(700);
+  }
+  if (!session.subscription) {
+    const customerId = typeof session.customer === 'string' ? session.customer : session.customer?.id;
+    session.subscription = await subscriptionForCustomer(customerId);
   }
 
   const uid = session.metadata?.userId || session.client_reference_id || userId;
@@ -203,32 +237,36 @@ export async function syncCheckoutSession(req, sessionId, userId) {
 
   const customerId = typeof session.customer === 'string' ? session.customer : session.customer?.id;
   const plan = session.metadata?.plan === 'family' ? 'family' : 'archive';
+  const end = new Date();
+  end.setMonth(end.getMonth() + 1);
+  const period = periodEnd(session.subscription) || end.toISOString();
+
+  let row = null;
   try {
     if (session.subscription) {
-      await applyCheckoutSession(req, session);
+      row = await applyCheckoutSession(req, session);
     } else if (checkoutLooksPaid(session)) {
-      throw new Error('subscription not attached yet');
+      row = await upsertBilling(req, {
+        userId: uid || userId,
+        stripeCustomerId: customerId,
+        stripeSubscriptionId: null,
+        plan,
+        status: 'active',
+        currentPeriodEnd: period,
+        cancelAtPeriodEnd: false,
+        source: 'stripe',
+        notes: 'Opened from a completed Checkout session.',
+      });
     }
   } catch (err) {
-    if (!checkoutLooksPaid(session)) throw err;
-    const end = new Date();
-    end.setMonth(end.getMonth() + 1);
-    const subId = typeof session.subscription === 'string'
-      ? session.subscription
-      : session.subscription?.id || null;
-    await upsertBilling(req, {
-      userId: uid || userId,
-      stripeCustomerId: customerId,
-      stripeSubscriptionId: subId,
-      plan,
-      status: 'active',
-      currentPeriodEnd: periodEnd(session.subscription) || end.toISOString(),
-      cancelAtPeriodEnd: false,
-      source: 'stripe',
-      notes: 'Opened from a completed Checkout session.',
-    });
+    console.warn('[billing] persist after checkout failed:', err.message);
   }
 
+  const fromStore = publicBilling(row);
+  if (fromStore.paid) return fromStore;
+  if (checkoutLooksPaid(session) || session.subscription) {
+    return forcedPaid(plan, row, period);
+  }
   return billingForUser(req, userId);
 }
 
