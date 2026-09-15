@@ -1,5 +1,5 @@
-import { createClient } from '@supabase/supabase-js';
 import { getPool } from './pool.js';
+import { getAdminClient } from '../middleware/auth.js';
 
 const COLS = 'user_id, stripe_customer_id, stripe_subscription_id, plan, status, price_id, current_period_end, cancel_at_period_end, updated_at';
 
@@ -26,11 +26,9 @@ function tableUnavailable(err) {
 }
 
 function adminFrom(req) {
-  if (req?.admin) return req.admin;
-  if (!process.env.SUPABASE_SECRET_KEY) return req?.supabase || null;
-  return createClient(process.env.SUPABASE_URL, process.env.SUPABASE_SECRET_KEY, {
-    auth: { autoRefreshToken: false, persistSession: false },
-  });
+  // Never fall back to the caller's user client — Auth then answers "User not allowed".
+  if (req?.admin?.auth?.admin && req.admin !== req.supabase) return req.admin;
+  return getAdminClient();
 }
 
 function fromMeta(userId, billing) {
@@ -62,7 +60,11 @@ async function readAppMeta(req, userId) {
 async function writeAppMeta(req, mapped) {
   const admin = adminFrom(req);
   if (!admin?.auth?.admin) return mapped;
-  const { data } = await admin.auth.admin.getUserById(mapped.userId);
+  const { data, error: readErr } = await admin.auth.admin.getUserById(mapped.userId);
+  if (readErr) {
+    console.warn('[billing] could not read user metadata:', readErr.message);
+    return mapped;
+  }
   const prev = data?.user?.app_metadata || {};
   const { error } = await admin.auth.admin.updateUserById(mapped.userId, {
     app_metadata: {
@@ -82,7 +84,10 @@ async function writeAppMeta(req, mapped) {
       },
     },
   });
-  if (error) throw new Error(error.message);
+  if (error) {
+    console.warn('[billing] could not write user metadata:', error.message);
+    return mapped;
+  }
   return mapped;
 }
 
@@ -200,7 +205,7 @@ export async function upsertBilling(req, patch) {
   }
 
   try {
-    const client = req?.admin || req?.supabase;
+    const client = adminFrom(req);
     if (client) {
       const { data, error } = await client
         .from('legacy_billing')

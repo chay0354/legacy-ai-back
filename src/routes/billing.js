@@ -1,6 +1,5 @@
 import { Router } from 'express';
 import express from 'express';
-import { createClient } from '@supabase/supabase-js';
 import { getPlan, PLAN_IDS, priceIdForPlan, publicPlans } from '../services/plans.js';
 import {
   applyCheckoutSession,
@@ -13,6 +12,7 @@ import {
   syncCheckoutSession,
 } from '../services/stripeBilling.js';
 import { getBillingByUserId } from '../db/billingRepo.js';
+import { getAdminClient } from '../middleware/auth.js';
 
 const router = Router();
 
@@ -24,10 +24,7 @@ function frontendBase(req) {
 }
 
 function serviceReq() {
-  const key = process.env.SUPABASE_SECRET_KEY;
-  const admin = key
-    ? createClient(process.env.SUPABASE_URL, key, { auth: { autoRefreshToken: false, persistSession: false } })
-    : null;
+  const admin = getAdminClient();
   return { admin, supabase: admin };
 }
 
@@ -109,7 +106,11 @@ router.post('/checkout', async (req, res) => {
         metadata: { userId: req.user.id },
       });
       customerId = customer.id;
-      await rememberCustomer(req, req.user.id, customerId);
+      try {
+        await rememberCustomer(req, req.user.id, customerId);
+      } catch (e) {
+        console.warn('[billing] could not remember customer:', e.message);
+      }
     }
 
     const front = frontendBase(req);

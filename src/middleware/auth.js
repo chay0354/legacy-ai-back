@@ -1,15 +1,36 @@
 import { createClient } from '@supabase/supabase-js';
 
-// Service-role client (RLS-bypassing). Used for privileged access management
-// such as accepting invitations. Only created when SUPABASE_SECRET_KEY is set.
+/** Prefer the current secret name; keep the older service-role name as a fallback. */
+export function serviceRoleKey() {
+  return process.env.SUPABASE_SECRET_KEY || process.env.SUPABASE_SERVICE_ROLE_KEY || '';
+}
+
+function looksLikeServiceRole(key) {
+  if (!key) return false;
+  if (key.startsWith('sb_publishable_') || key.startsWith('sb_anon_')) return false;
+  if (key.startsWith('sb_secret_')) return true;
+  if (key.startsWith('eyJ')) {
+    try {
+      const payload = JSON.parse(Buffer.from(key.split('.')[1], 'base64url').toString('utf8'));
+      return payload.role === 'service_role';
+    } catch {
+      return false;
+    }
+  }
+  return key.length > 20;
+}
+
+// Service-role client (RLS-bypassing). Never reuse the caller's user JWT.
 let adminClient = null;
 function getAdminClient() {
   if (adminClient !== null) return adminClient || null;
-  if (process.env.SUPABASE_SECRET_KEY) {
-    adminClient = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_SECRET_KEY, {
+  const key = serviceRoleKey();
+  if (looksLikeServiceRole(key)) {
+    adminClient = createClient(process.env.SUPABASE_URL, key, {
       auth: { autoRefreshToken: false, persistSession: false },
     });
   } else {
+    if (key) console.warn('[auth] SUPABASE_SECRET_KEY is not a service-role key — admin writes will be skipped.');
     adminClient = false;
   }
   return adminClient || null;
@@ -26,7 +47,7 @@ export async function requireAuth(req, res, next) {
   const token = header.slice(7);
   const supabase = createClient(
     process.env.SUPABASE_URL,
-    process.env.SUPABASE_SECRET_KEY || process.env.SUPABASE_PUBLISHABLE_KEY,
+    process.env.SUPABASE_PUBLISHABLE_KEY || serviceRoleKey(),
     { global: { headers: { Authorization: `Bearer ${token}` } } }
   );
 
