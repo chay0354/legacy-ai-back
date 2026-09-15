@@ -8,6 +8,7 @@ import accessRouter, { previewInvite } from './routes/access.js';
 import avatarRouter from './routes/avatar.js';
 import authRouter from './routes/auth.js';
 import billingRouter, { billingWebhookHandler } from './routes/billing.js';
+import adminRouter from './routes/admin.js';
 import { publicPlans } from './services/plans.js';
 import { stripeConfigured } from './services/stripeBilling.js';
 import { ensureSchema, getPool } from './db/pool.js';
@@ -90,6 +91,7 @@ export function createApp() {
   });
 
   app.use('/api/auth', authRouter);
+  app.use('/api/admin', adminRouter);
   app.get('/api/billing/plans', (_req, res) => {
     res.json({ plans: publicPlans(), configured: stripeConfigured() });
   });

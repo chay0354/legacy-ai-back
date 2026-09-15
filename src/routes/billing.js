@@ -10,6 +10,7 @@ import {
   rememberCustomer,
   stripeClient,
   stripeConfigured,
+  syncCheckoutSession,
 } from '../services/stripeBilling.js';
 import { getBillingByUserId } from '../db/billingRepo.js';
 
@@ -161,24 +162,16 @@ router.post('/portal', async (req, res) => {
   }
 });
 
-/** After Checkout redirect — sync if the webhook has not arrived yet. */
+/** After Checkout redirect — write paid access even if the webhook is late. */
 router.post('/sync', async (req, res) => {
   try {
     const sessionId = String(req.body?.sessionId || '').trim();
     if (!sessionId) return res.status(400).json({ error: 'sessionId required' });
-    const stripe = stripeClient();
-    const session = await stripe.checkout.sessions.retrieve(sessionId, { expand: ['subscription'] });
-    const uid = session.metadata?.userId || session.client_reference_id;
-    if (uid && uid !== req.user.id) {
-      return res.status(403).json({ error: 'This checkout belongs to another account.' });
-    }
-    // The webhook may already have done this, or Stripe may still be settling — either is fine.
-    if (session.subscription) {
-      await applyCheckoutSession(req, session);
-    }
-    res.json(await billingForUser(req, req.user.id));
+    const billing = await syncCheckoutSession(req, sessionId, req.user.id);
+    res.json(billing);
   } catch (err) {
-    res.status(500).json({ error: err.message });
+    const status = err.status || 500;
+    res.status(status).json({ error: err.message });
   }
 });
 

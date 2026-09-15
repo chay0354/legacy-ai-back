@@ -15,6 +15,8 @@ function getAdminClient() {
   return adminClient || null;
 }
 
+export { getAdminClient };
+
 export async function requireAuth(req, res, next) {
   const header = req.headers.authorization;
   if (!header?.startsWith('Bearer ')) {

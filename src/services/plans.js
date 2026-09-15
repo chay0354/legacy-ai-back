@@ -56,8 +56,12 @@ export function planIdFromPriceId(priceId) {
 
 const ACTIVE = new Set(['active', 'trialing']);
 
-export function isPaidStatus(status) {
-  return ACTIVE.has(String(status || '').toLowerCase());
+export function isPaidStatus(status, currentPeriodEnd) {
+  if (!ACTIVE.has(String(status || '').toLowerCase())) return false;
+  if (!currentPeriodEnd) return true;
+  const end = new Date(currentPeriodEnd);
+  if (Number.isNaN(end.getTime())) return true;
+  return end.getTime() > Date.now();
 }
 
 export function publicPlans() {

@@ -3,7 +3,7 @@ import { getPool } from './pool.js';
 
 const COLS = 'user_id, stripe_customer_id, stripe_subscription_id, plan, status, price_id, current_period_end, cancel_at_period_end, updated_at';
 
-function mapRow(row) {
+function mapRow(row, extras = {}) {
   if (!row) return null;
   return {
     userId: row.user_id,
@@ -15,6 +15,9 @@ function mapRow(row) {
     currentPeriodEnd: row.current_period_end || null,
     cancelAtPeriodEnd: Boolean(row.cancel_at_period_end),
     updatedAt: row.updated_at || null,
+    source: extras.source || row.source || null,
+    notes: extras.notes || row.notes || null,
+    credits: extras.credits || row.credits || [],
   };
 }
 
@@ -42,6 +45,9 @@ function fromMeta(userId, billing) {
     currentPeriodEnd: billing.currentPeriodEnd || null,
     cancelAtPeriodEnd: Boolean(billing.cancelAtPeriodEnd),
     updatedAt: billing.updatedAt || null,
+    source: billing.source || null,
+    notes: billing.notes || null,
+    credits: Array.isArray(billing.credits) ? billing.credits : [],
   };
 }
 
@@ -58,7 +64,7 @@ async function writeAppMeta(req, mapped) {
   if (!admin?.auth?.admin) return mapped;
   const { data } = await admin.auth.admin.getUserById(mapped.userId);
   const prev = data?.user?.app_metadata || {};
-  await admin.auth.admin.updateUserById(mapped.userId, {
+  const { error } = await admin.auth.admin.updateUserById(mapped.userId, {
     app_metadata: {
       ...prev,
       billing: {
@@ -70,9 +76,13 @@ async function writeAppMeta(req, mapped) {
         currentPeriodEnd: mapped.currentPeriodEnd,
         cancelAtPeriodEnd: mapped.cancelAtPeriodEnd,
         updatedAt: mapped.updatedAt,
+        source: mapped.source || null,
+        notes: mapped.notes || null,
+        credits: mapped.credits || [],
       },
     },
   });
+  if (error) throw new Error(error.message);
   return mapped;
 }
 
@@ -85,7 +95,10 @@ export async function getBillingByUserId(req, userId) {
         `SELECT ${COLS} FROM legacy_billing WHERE user_id = $1`,
         [userId],
       );
-      if (rows[0]) return mapRow(rows[0]);
+      if (rows[0]) {
+        const meta = await readAppMeta(req, userId);
+        return mapRow(rows[0], meta || {});
+      }
     } catch (err) {
       if (!tableUnavailable(err)) throw err;
     }
@@ -94,7 +107,10 @@ export async function getBillingByUserId(req, userId) {
     const client = req?.admin || req?.supabase;
     if (client) {
       const { data, error } = await client.from('legacy_billing').select('*').eq('user_id', userId).maybeSingle();
-      if (!error && data) return mapRow(data);
+      if (!error && data) {
+        const meta = await readAppMeta(req, userId);
+        return mapRow(data, meta || {});
+      }
     }
   } catch (err) {
     if (!tableUnavailable(err)) throw err;
@@ -128,8 +144,18 @@ export async function getBillingByCustomerId(req, customerId) {
   return null;
 }
 
+function extrasFrom(patch, existing = {}) {
+  return {
+    source: patch.source !== undefined ? patch.source : (existing.source || null),
+    notes: patch.notes !== undefined ? patch.notes : (existing.notes || null),
+    credits: Array.isArray(patch.credits) ? patch.credits : (existing.credits || []),
+  };
+}
+
 export async function upsertBilling(req, patch) {
   if (!patch?.userId) throw new Error('userId required');
+  const existing = await getBillingByUserId(req, patch.userId).catch(() => null);
+  const extras = extrasFrom(patch, existing || {});
   const row = {
     user_id: patch.userId,
     stripe_customer_id: patch.stripeCustomerId ?? null,
@@ -165,7 +191,7 @@ export async function upsertBilling(req, patch) {
           row.price_id, row.current_period_end, row.cancel_at_period_end, row.updated_at,
         ],
       );
-      const mapped = mapRow(rows[0]);
+      const mapped = mapRow(rows[0], extras);
       await writeAppMeta(req, mapped).catch(() => {});
       return mapped;
     } catch (err) {
@@ -182,7 +208,7 @@ export async function upsertBilling(req, patch) {
         .select('*')
         .single();
       if (!error && data) {
-        const mapped = mapRow(data);
+        const mapped = mapRow(data, extras);
         await writeAppMeta(req, mapped).catch(() => {});
         return mapped;
       }
@@ -191,7 +217,7 @@ export async function upsertBilling(req, patch) {
     if (!tableUnavailable(err)) throw err;
   }
 
-  return writeAppMeta(req, mapRow(row));
+  return writeAppMeta(req, mapRow(row, extras));
 }
 
 export async function countOwnedArchives(req, userId) {
