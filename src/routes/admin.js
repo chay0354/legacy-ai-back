@@ -4,6 +4,7 @@ import {
   adminConfigured, credentialsMatch, requireAdmin, signAdminToken,
 } from '../middleware/adminAuth.js';
 import { getPlan } from '../services/plans.js';
+import { grantMissingPlans } from '../services/grantMissingPlans.js';
 import { publicBilling, stripeClient, stripeConfigured } from '../services/stripeBilling.js';
 import { getBillingByUserId, upsertBilling } from '../db/billingRepo.js';
 import { getPool } from '../db/pool.js';
@@ -239,9 +240,18 @@ router.get('/users/:id', requireAdmin, async (req, res) => {
   }
 });
 
+router.post('/grant-missing-plans', requireAdmin, async (_req, res) => {
+  try {
+    res.json(await grantMissingPlans());
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
 router.post('/users/:id/plan', requireAdmin, async (req, res) => {
   try {
-    const plan = req.body?.plan === 'family' ? 'family' : req.body?.plan === 'none' ? 'none' : 'archive';
+    const allowed = new Set(['setup', 'monthly', 'preserve', 'archive', 'family', 'none']);
+    const plan = allowed.has(req.body?.plan) ? req.body.plan : 'monthly';
     const lifetime = Boolean(req.body?.lifetime);
     const status = plan === 'none' ? 'canceled' : 'active';
     const row = await applyBilling(req.params.id, {

@@ -22,7 +22,7 @@ import {
   saveCreatorIdentity,
 } from '../services/genderProfile.js';
 import { assertVoiceSampleLongEnough } from '../services/audioDuration.js';
-import { assertArchivePaid, assertUserPaid } from '../services/stripeBilling.js';
+import { assertArchivePaid, assertCanViewArchive, assertUserPaid } from '../services/stripeBilling.js';
 import { toPaymentError } from './billing.js';
 
 const router = Router();
@@ -963,6 +963,7 @@ router.post('/ask', async (req, res) => {
 
     const creatorId = await resolveTalkCreatorId(req);
     if (!creatorId) return res.status(404).json({ error: 'No legacy specified' });
+    await assertCanViewArchive(req, creatorId);
 
     const assets = await getAssets(req, creatorId);
     const languageCode = resolveAnamLanguage(assets);
@@ -975,7 +976,7 @@ router.post('/ask', async (req, res) => {
 
     res.json({ answer: answer.trim(), creatorId });
   } catch (e) {
-    res.status(500).json({ error: e.message });
+    sendAvatarError(res, e);
   }
 });
 
@@ -1217,7 +1218,7 @@ router.post('/provision', async (req, res) => {
   try {
     const creator = await getOwnedCreator(req);
     if (!creator) return res.status(404).json({ error: 'No legacy found for this user' });
-    await assertUserPaid(req);
+    await assertCanViewArchive(req, creator.id);
 
     let assets = await getAssets(req, creator.id);
     if (anamReady(assets)) {

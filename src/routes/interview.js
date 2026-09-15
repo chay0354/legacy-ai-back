@@ -13,8 +13,7 @@ import {
   getProfilePg,
 } from '../db/legacyRepo.js';
 import { processInterviewSession } from '../services/interviewProcessor.js';
-import { assertUserPaid } from '../services/stripeBilling.js';
-import { toPaymentError } from './billing.js';
+import { assertUserPaid, ownerCanViewArchive, stripeConfigured } from '../services/stripeBilling.js';
 import { conductorTurn } from '../services/interviewConductor.js';
 import { openAiConfigured, transcribeWhisper } from '../services/openai.js';
 import { speakInterviewer, interviewerTtsConfigured } from '../services/interviewVoice.js';
@@ -741,11 +740,43 @@ router.post('/session/:sessionId/complete', async (req, res) => {
   }
 });
 
+function archiveHasProgress(creator) {
+  return Number(creator?.avatar_level) > 0 || Number(creator?.completion_score) > 0;
+}
+
+function lockedArchivePayload(creator, role) {
+  return {
+    locked: true,
+    lockReason: 'preserve',
+    role,
+    creator: {
+      id: creator?.id,
+      user_id: creator?.user_id,
+      display_name: creator?.display_name,
+      avatar_level: creator?.avatar_level,
+      completion_score: creator?.completion_score,
+    },
+    coverage: [],
+    memories: [],
+    gallery: [],
+    relationships: [],
+    values: [],
+    wisdom: [],
+    openThreads: [],
+    personality: null,
+    sessionCount: 0,
+    latestSessionSummary: null,
+    latestSessionStage: null,
+    latestSessionLabel: null,
+  };
+}
+
 /**
  * GET /api/interview/profile[?creatorId=]
  * Returns a legacy's extracted data. Viewable by any member of that legacy
  * (creator / administrator / member). Without creatorId, defaults to the
  * requester's own legacy (creating it on first visit).
+ * Preserve plans can interview but do not receive the extracted archive.
  */
 router.get('/profile', async (req, res) => {
   try {
@@ -765,6 +796,13 @@ router.get('/profile', async (req, res) => {
         await ensureOwnerMembership(req, creator.id);
         creatorId = creator.id;
         role = 'creator';
+      }
+      if (stripeConfigured() && !(await ownerCanViewArchive(req, creatorId))) {
+        const stub = await getProfilePg(creatorId).catch(() => ({ creator: { id: creatorId } }));
+        const creator = stub.creator || { id: creatorId };
+        if (archiveHasProgress(creator)) {
+          return res.json(lockedArchivePayload(creator, role));
+        }
       }
       const profile = await getProfilePg(creatorId);
       const gallery = await Promise.all(
@@ -798,6 +836,9 @@ router.get('/profile', async (req, res) => {
     if (!creatorRow) return res.status(404).json({ error: 'Legacy not found' });
 
     const creatorId = creatorRow.id;
+    if (stripeConfigured() && !(await ownerCanViewArchive(req, creatorId)) && archiveHasProgress(creatorRow)) {
+      return res.json(lockedArchivePayload(creatorRow, role));
+    }
     const [coverage, memories, relationships, values, wisdom, threads, personality, sessions, latestSession, galleryRows] = await Promise.all([
       req.supabase.from('legacy_coverage').select('*').eq('creator_id', creatorId),
       req.supabase.from('legacy_memories').select('id, title, summary, full_transcript, category, importance, lesson_learned, year, emotional_significance, people_involved').eq('creator_id', creatorId).order('year', { ascending: true, nullsFirst: false }).order('importance', { ascending: false }).limit(100),

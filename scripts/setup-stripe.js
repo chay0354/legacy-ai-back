@@ -1,10 +1,10 @@
 /**
- * Create The Archive + Family prices in Stripe if they do not already exist.
+ * Create Stripe products/prices for the current catalog if they do not already exist.
  * Prints price IDs for .env — does not print secret keys.
  */
 import 'dotenv/config';
 import Stripe from 'stripe';
-import { PLANS } from '../src/services/plans.js';
+import { PLANS, PUBLIC_PLAN_IDS, PLAN_IDS } from '../src/services/plans.js';
 
 const key = process.env.STRIPE_SECRET_KEY;
 if (!key) {
@@ -30,19 +30,32 @@ async function ensurePrice(plan) {
   const match = prices.data.find((p) =>
     p.unit_amount === plan.amount
     && p.currency === plan.currency
-    && p.recurring?.interval === plan.interval,
+    && (plan.interval
+      ? p.recurring?.interval === plan.interval
+      : !p.recurring),
   );
   if (match) return match;
-  return stripe.prices.create({
+  const params = {
     product: product.id,
     unit_amount: plan.amount,
     currency: plan.currency,
-    recurring: { interval: plan.interval },
     metadata: { legacy_plan: plan.id },
-  });
+  };
+  if (plan.interval) params.recurring = { interval: plan.interval };
+  return stripe.prices.create(params);
 }
 
-const archive = await ensurePrice(PLANS.archive);
-const family = await ensurePrice(PLANS.family);
-console.log(`STRIPE_PRICE_ARCHIVE=${archive.id}`);
-console.log(`STRIPE_PRICE_FAMILY=${family.id}`);
+const ids = PUBLIC_PLAN_IDS.concat(PLAN_IDS.filter((id) => !PUBLIC_PLAN_IDS.includes(id)));
+const envName = {
+  setup: 'STRIPE_PRICE_SETUP',
+  monthly: 'STRIPE_PRICE_MONTHLY',
+  preserve: 'STRIPE_PRICE_PRESERVE',
+  addon: 'STRIPE_PRICE_ADDON',
+  archive: 'STRIPE_PRICE_ARCHIVE',
+  family: 'STRIPE_PRICE_FAMILY',
+};
+
+for (const id of ids) {
+  const price = await ensurePrice(PLANS[id]);
+  console.log(`${envName[id]}=${price.id}`);
+}

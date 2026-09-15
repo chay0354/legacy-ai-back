@@ -1,6 +1,6 @@
 import { Router } from 'express';
 import express from 'express';
-import { getPlan, PLAN_IDS, priceIdForPlan, publicPlans } from '../services/plans.js';
+import { checkoutPlanId, getPlan, PLAN_IDS, priceIdForPlan, publicPlans } from '../services/plans.js';
 import {
   applyCheckoutSession,
   applySubscriptionEvent,
@@ -48,7 +48,9 @@ export function billingWebhookHandler() {
       try {
         if (event.type === 'checkout.session.completed') {
           const session = event.data.object;
-          if (session.mode === 'subscription') await applyCheckoutSession(ctx, session);
+          if (session.mode === 'subscription' || session.mode === 'payment') {
+            await applyCheckoutSession(ctx, session);
+          }
         } else if (
           event.type === 'customer.subscription.updated'
           || event.type === 'customer.subscription.deleted'
@@ -91,7 +93,9 @@ router.get('/status', async (req, res) => {
 router.post('/checkout', async (req, res) => {
   try {
     if (!stripeConfigured()) return res.status(503).json({ error: 'Billing is not configured yet.' });
-    const planId = req.body?.plan === 'family' ? 'family' : 'archive';
+    const planId = checkoutPlanId(req.body?.plan);
+    if (!planId) return res.status(400).json({ error: 'Choose Set up, Monthly, Preserve, or a 30 minute add-on.' });
+    const spec = getPlan(planId);
     const priceId = priceIdForPlan(planId);
     if (!priceId) return res.status(503).json({ error: `Missing Stripe price for ${planId}` });
 
@@ -114,21 +118,24 @@ router.post('/checkout', async (req, res) => {
     }
 
     const front = frontendBase(req);
+    const mode = spec.checkoutMode === 'payment' ? 'payment' : 'subscription';
     const params = {
-      mode: 'subscription',
+      mode,
       customer: customerId,
       client_reference_id: req.user.id,
       line_items: [{ price: priceId, quantity: 1 }],
       success_url: `${front}/billing/success?session_id={CHECKOUT_SESSION_ID}`,
       cancel_url: `${front}/pricing`,
       allow_promotion_codes: true,
-      metadata: { userId: req.user.id, plan: planId },
-      subscription_data: {
-        metadata: { userId: req.user.id, plan: planId },
-      },
+      metadata: { userId: req.user.id, plan: planId, priceId },
       // The site quotes USD, so Checkout must charge USD rather than a converted local amount.
       adaptive_pricing: { enabled: false },
     };
+    if (mode === 'subscription') {
+      params.subscription_data = {
+        metadata: { userId: req.user.id, plan: planId },
+      };
+    }
 
     let session;
     try {

@@ -1,5 +1,86 @@
 /** Customer plans. Amounts must match the Stripe Price objects. */
 export const PLANS = {
+  setup: {
+    id: 'setup',
+    name: 'Set up',
+    cadence: 'one time · includes first 3 months',
+    amount: 69900,
+    currency: 'usd',
+    interval: null,
+    checkoutMode: 'payment',
+    maxOwnedArchives: 20,
+    monthsIncluded: 3,
+    minutes: 180,
+    canInterview: true,
+    canViewArchive: true,
+    public: true,
+    primary: false,
+    lines: [
+      'Everything in Monthly, prepaid for three months',
+      'Interview, archive, live avatar, and family access',
+      '180 minutes included',
+    ],
+  },
+  monthly: {
+    id: 'monthly',
+    name: 'Monthly',
+    cadence: 'per month · 60 minutes',
+    amount: 6990,
+    currency: 'usd',
+    interval: 'month',
+    checkoutMode: 'subscription',
+    maxOwnedArchives: 20,
+    minutes: 60,
+    canInterview: true,
+    canViewArchive: true,
+    public: true,
+    primary: true,
+    lines: [
+      'Guided interview and a full archive you can read',
+      'Live avatar and family invitations',
+      '60 minutes each month',
+    ],
+  },
+  preserve: {
+    id: 'preserve',
+    name: 'Preserve',
+    cadence: 'one time · interview only',
+    amount: 699,
+    currency: 'usd',
+    interval: null,
+    checkoutMode: 'payment',
+    maxOwnedArchives: 1,
+    minutes: 0,
+    canInterview: true,
+    canViewArchive: false,
+    public: true,
+    primary: false,
+    lines: [
+      'Record the guided interview',
+      'We keep what you share',
+      'Pay Monthly or Set up when you want to see the archive',
+    ],
+  },
+  addon: {
+    id: 'addon',
+    name: '30 min add',
+    cadence: 'one time extra minutes',
+    amount: 2999,
+    currency: 'usd',
+    interval: null,
+    checkoutMode: 'payment',
+    kind: 'addon',
+    maxOwnedArchives: 0,
+    minutes: 30,
+    canInterview: false,
+    canViewArchive: false,
+    public: true,
+    primary: false,
+    lines: [
+      'Add 30 minutes to an active Monthly or Set up plan',
+    ],
+  },
+  /** Complimentary / older Stripe subscribers — full access, not sold on the site. */
   archive: {
     id: 'archive',
     name: 'The Archive',
@@ -7,14 +88,13 @@ export const PLANS = {
     amount: 1900,
     currency: 'usd',
     interval: 'month',
+    checkoutMode: 'subscription',
     maxOwnedArchives: 1,
-    lines: [
-      'Guided interview across all three stages',
-      'Unlimited stories and entries',
-      'Voice memories, photographs, and a live avatar',
-      'Family access for the people you invite',
-      'Edit or remove anything, at any time',
-    ],
+    minutes: 60,
+    canInterview: true,
+    canViewArchive: true,
+    public: false,
+    lines: [],
   },
   family: {
     id: 'family',
@@ -23,24 +103,34 @@ export const PLANS = {
     amount: 3900,
     currency: 'usd',
     interval: 'month',
+    checkoutMode: 'subscription',
     maxOwnedArchives: 20,
-    lines: [
-      'Everything in The Archive',
-      'Two or more archives, kept separately',
-      'Administrator help for a parent or relative',
-      'Shared family access settings',
-    ],
+    minutes: 60,
+    canInterview: true,
+    canViewArchive: true,
+    public: false,
+    lines: [],
   },
 };
 
 export const PLAN_IDS = Object.keys(PLANS);
+export const PUBLIC_PLAN_IDS = PLAN_IDS.filter((id) => PLANS[id].public);
+
+const PRICE_ENV = {
+  setup: 'STRIPE_PRICE_SETUP',
+  monthly: 'STRIPE_PRICE_MONTHLY',
+  preserve: 'STRIPE_PRICE_PRESERVE',
+  addon: 'STRIPE_PRICE_ADDON',
+  archive: 'STRIPE_PRICE_ARCHIVE',
+  family: 'STRIPE_PRICE_FAMILY',
+};
 
 export function getPlan(id) {
   return PLANS[id] || null;
 }
 
 export function priceEnvName(planId) {
-  return planId === 'family' ? 'STRIPE_PRICE_FAMILY' : 'STRIPE_PRICE_ARCHIVE';
+  return PRICE_ENV[planId] || PRICE_ENV.monthly;
 }
 
 export function priceIdForPlan(planId) {
@@ -49,9 +139,28 @@ export function priceIdForPlan(planId) {
 
 export function planIdFromPriceId(priceId) {
   if (!priceId) return null;
-  if (priceId === process.env.STRIPE_PRICE_FAMILY) return 'family';
-  if (priceId === process.env.STRIPE_PRICE_ARCHIVE) return 'archive';
+  for (const id of PLAN_IDS) {
+    if (priceId === process.env[PRICE_ENV[id]]) return id;
+  }
   return null;
+}
+
+export function checkoutPlanId(raw) {
+  const id = String(raw || '').toLowerCase();
+  if (getPlan(id) && id !== 'none') return id;
+  return null;
+}
+
+export function isAddonPlan(id) {
+  return getPlan(id)?.kind === 'addon';
+}
+
+export function planCanInterview(id) {
+  return Boolean(getPlan(id)?.canInterview);
+}
+
+export function planCanViewArchive(id) {
+  return Boolean(getPlan(id)?.canViewArchive);
 }
 
 const ACTIVE = new Set(['active', 'trialing']);
@@ -65,7 +174,7 @@ export function isPaidStatus(status, currentPeriodEnd) {
 }
 
 export function publicPlans() {
-  return PLAN_IDS.map((id) => {
+  return PUBLIC_PLAN_IDS.map((id) => {
     const p = PLANS[id];
     return {
       id: p.id,
@@ -73,10 +182,13 @@ export function publicPlans() {
       cadence: p.cadence,
       amount: p.amount,
       currency: p.currency,
-      interval: p.interval,
+      interval: p.interval || 'once',
       displayPrice: formatMoney(p.amount, p.currency),
       lines: p.lines,
-      primary: id === 'archive',
+      primary: Boolean(p.primary),
+      kind: p.kind || 'plan',
+      canInterview: Boolean(p.canInterview),
+      canViewArchive: Boolean(p.canViewArchive),
     };
   });
 }
@@ -89,6 +201,10 @@ export function formatMoney(amountCents, currency = 'usd') {
       minimumFractionDigits: amountCents % 100 === 0 ? 0 : 2,
     }).format(amountCents / 100);
   } catch {
-    return `$${(amountCents / 100).toFixed(0)}`;
+    return `$${(amountCents / 100).toFixed(2)}`;
   }
+}
+
+export function planDisplayName(id) {
+  return getPlan(id)?.name || 'None';
 }

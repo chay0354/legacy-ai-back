@@ -1,6 +1,7 @@
 import Stripe from 'stripe';
 import {
-  getPlan, isPaidStatus, planIdFromPriceId, priceIdForPlan,
+  getPlan, isAddonPlan, isPaidStatus, planCanInterview, planCanViewArchive,
+  planIdFromPriceId, priceIdForPlan,
 } from './plans.js';
 import {
   getBillingByCustomerId, getBillingByUserId, ownerUserIdForCreator, upsertBilling,
@@ -13,21 +14,31 @@ export function stripeClient() {
 }
 
 export function stripeConfigured() {
-  return Boolean(process.env.STRIPE_SECRET_KEY && priceIdForPlan('archive') && priceIdForPlan('family'));
+  return Boolean(process.env.STRIPE_SECRET_KEY && (
+    priceIdForPlan('monthly')
+    || priceIdForPlan('archive')
+    || priceIdForPlan('preserve')
+    || priceIdForPlan('setup')
+    || priceIdForPlan('family')
+  ));
 }
 
 export function publicBilling(row) {
   const paid = isPaidStatus(row?.status, row?.currentPeriodEnd);
+  const plan = paid ? (row.plan || 'none') : 'none';
   return {
-    plan: paid ? (row.plan || 'none') : 'none',
+    plan,
     status: row?.status || 'none',
     paid,
     cancelAtPeriodEnd: Boolean(row?.cancelAtPeriodEnd),
     currentPeriodEnd: row?.currentPeriodEnd || null,
-    maxOwnedArchives: paid ? (getPlan(row.plan)?.maxOwnedArchives || 1) : 0,
+    maxOwnedArchives: paid ? (getPlan(plan)?.maxOwnedArchives || 1) : 0,
     source: row?.source || null,
     notes: row?.notes || null,
     credits: row?.credits || [],
+    minutesRemaining: paid ? (Number(row?.minutesRemaining) || 0) : 0,
+    canInterview: paid && planCanInterview(plan),
+    canViewArchive: paid && planCanViewArchive(plan),
   };
 }
 
@@ -80,21 +91,42 @@ function paymentError(message) {
   return err;
 }
 
-/** Owner starting paid work on their own account. */
+/** Owner starting the interview (Preserve is enough). */
 export async function assertUserPaid(req) {
   if (!stripeConfigured()) return publicBilling(null);
   const billing = await billingForUser(req, req.user.id);
-  if (!billing.paid) {
-    throw paymentError('Choose a plan to start the interview, live avatar, and family invitations.');
+  if (!billing.canInterview) {
+    throw paymentError('Choose a plan to start the interview.');
   }
   return billing;
 }
 
-/** Paid work billed to the archive owner (live call by family still needs the owner’s plan). */
+export async function assertCanViewArchive(req, creatorId) {
+  if (!stripeConfigured()) return publicBilling(null);
+  const ownerId = creatorId
+    ? await ownerUserIdForCreator(req, creatorId)
+    : req.user.id;
+  if (!ownerId) throw paymentError('Choose a plan to see the archive.');
+  const billing = await billingForUser(req, ownerId);
+  if (!billing.canViewArchive) {
+    throw paymentError('Pay Monthly or Set up to see the stories, people, and wisdom from this interview.');
+  }
+  return billing;
+}
+
+export async function ownerCanViewArchive(req, creatorId) {
+  if (!stripeConfigured()) return true;
+  const ownerId = await ownerUserIdForCreator(req, creatorId);
+  if (!ownerId) return false;
+  const billing = await billingForUser(req, ownerId);
+  return Boolean(billing.canViewArchive);
+}
+
+/** Live avatar and family invitations need a plan that opens the archive. */
 export async function assertArchivePaid(req, creatorId) {
   if (!stripeConfigured()) return;
-  if (!(await ownerIsPaid(req, creatorId))) {
-    throw paymentError('This archive needs an active plan for live calls and new recordings.');
+  if (!(await ownerCanViewArchive(req, creatorId))) {
+    throw paymentError('This archive needs Monthly or Set up for live calls and family invitations.');
   }
 }
 
@@ -118,6 +150,7 @@ export async function rememberCustomer(req, userId, customerId) {
     priceId: existing?.priceId,
     currentPeriodEnd: existing?.currentPeriodEnd,
     cancelAtPeriodEnd: existing?.cancelAtPeriodEnd,
+    minutesRemaining: existing?.minutesRemaining || 0,
   });
 }
 
@@ -152,17 +185,76 @@ export async function persistSubscription(req, { userId, customerId, subscriptio
   const priceId = item?.price?.id || null;
   const plan = planIdFromPriceId(priceId)
     || subscription?.metadata?.plan
-    || 'archive';
+    || 'monthly';
+  const resolved = getPlan(plan) ? plan : 'monthly';
+  const spec = getPlan(resolved);
+  const existingMinutes = Number(existing?.minutesRemaining) || 0;
   return upsertBilling(req, {
     userId,
     stripeCustomerId: customerId || subscription?.customer || null,
     stripeSubscriptionId: subscription?.id || null,
-    plan: getPlan(plan) ? plan : 'archive',
+    plan: resolved,
     status: paidEnoughStatus(subscription?.status, checkoutPaid),
     priceId,
     currentPeriodEnd: periodEnd(subscription),
     cancelAtPeriodEnd: Boolean(subscription?.cancel_at_period_end),
     source: 'stripe',
+    minutesRemaining: existingMinutes > 0 ? existingMinutes : (spec?.minutes || 0),
+  });
+}
+
+function addMonthsIso(months) {
+  const end = new Date();
+  end.setMonth(end.getMonth() + months);
+  return end.toISOString();
+}
+
+export async function persistOneTimePurchase(req, {
+  userId, customerId, plan: rawPlan, priceId = null, checkoutPaid = false,
+}) {
+  if (!checkoutPaid) return getBillingByUserId(req, userId);
+  const existing = await getBillingByUserId(req, userId);
+  const plan = getPlan(rawPlan) ? rawPlan : 'preserve';
+
+  if (isAddonPlan(plan)) {
+    return upsertBilling(req, {
+      userId,
+      stripeCustomerId: customerId || existing?.stripeCustomerId || null,
+      stripeSubscriptionId: existing?.stripeSubscriptionId || null,
+      plan: existing?.plan || 'none',
+      status: existing?.status || 'none',
+      priceId: existing?.priceId || priceId,
+      currentPeriodEnd: existing?.currentPeriodEnd || null,
+      cancelAtPeriodEnd: existing?.cancelAtPeriodEnd || false,
+      source: existing?.source || 'stripe',
+      notes: existing?.notes || null,
+      credits: existing?.credits || [],
+      minutesRemaining: (Number(existing?.minutesRemaining) || 0) + (getPlan(plan)?.minutes || 30),
+    });
+  }
+
+  if (plan === 'preserve' && planCanViewArchive(existing?.plan) && isPaidStatus(existing?.status, existing?.currentPeriodEnd)) {
+    return existing;
+  }
+
+  const spec = getPlan(plan);
+  const period = spec?.monthsIncluded ? addMonthsIso(spec.monthsIncluded) : null;
+  const existingMinutes = Number(existing?.minutesRemaining) || 0;
+  return upsertBilling(req, {
+    userId,
+    stripeCustomerId: customerId || existing?.stripeCustomerId || null,
+    stripeSubscriptionId: existing?.stripeSubscriptionId || null,
+    plan,
+    status: 'active',
+    priceId,
+    currentPeriodEnd: period,
+    cancelAtPeriodEnd: false,
+    source: 'stripe',
+    notes: plan === 'preserve'
+      ? 'Interview only — pay Monthly or Set up to see the archive.'
+      : existing?.notes || null,
+    credits: existing?.credits || [],
+    minutesRemaining: existingMinutes > 0 ? existingMinutes : (spec?.minutes || 0),
   });
 }
 
@@ -172,17 +264,35 @@ export async function applyCheckoutSession(req, session) {
     || session.client_reference_id
     || (await userIdFromCustomer(customerId));
   if (!userId) throw new Error('Checkout session missing userId');
+  const plan = session.metadata?.plan || planIdFromPriceId(session.metadata?.priceId) || 'monthly';
+  const paid = checkoutLooksPaid(session);
+
+  if (session.mode === 'payment' || isAddonPlan(plan) || getPlan(plan)?.checkoutMode === 'payment') {
+    return persistOneTimePurchase(req, {
+      userId,
+      customerId,
+      plan,
+      priceId: session.metadata?.priceId || null,
+      checkoutPaid: paid,
+    });
+  }
+
   const stripe = stripeClient();
   let subscription = session.subscription;
   if (typeof subscription === 'string') {
     subscription = await stripe.subscriptions.retrieve(subscription);
   }
-  if (!subscription) throw new Error('Checkout session has no subscription');
+  if (!subscription) {
+    if (paid) {
+      return persistOneTimePurchase(req, { userId, customerId, plan, checkoutPaid: true });
+    }
+    throw new Error('Checkout session has no subscription');
+  }
   return persistSubscription(req, {
     userId,
     customerId,
     subscription,
-    checkoutPaid: checkoutLooksPaid(session),
+    checkoutPaid: paid,
   });
 }
 
@@ -195,17 +305,15 @@ async function subscriptionForCustomer(customerId) {
 }
 
 function forcedPaid(plan, row, period) {
-  return {
+  return publicBilling({
+    ...row,
     plan,
     status: 'active',
-    paid: true,
-    cancelAtPeriodEnd: false,
     currentPeriodEnd: row?.currentPeriodEnd || period,
-    maxOwnedArchives: getPlan(plan)?.maxOwnedArchives || 1,
+    cancelAtPeriodEnd: false,
     source: 'stripe',
-    notes: row?.notes || null,
-    credits: row?.credits || [],
-  };
+    minutesRemaining: row?.minutesRemaining || getPlan(plan)?.minutes || 0,
+  });
 }
 
 /**
@@ -236,36 +344,24 @@ export async function syncCheckoutSession(req, sessionId, userId) {
   }
 
   const customerId = typeof session.customer === 'string' ? session.customer : session.customer?.id;
-  const plan = session.metadata?.plan === 'family' ? 'family' : 'archive';
-  const end = new Date();
-  end.setMonth(end.getMonth() + 1);
-  const period = periodEnd(session.subscription) || end.toISOString();
+  const plan = session.metadata?.plan || 'monthly';
+  const spec = getPlan(plan);
+  const period = periodEnd(session.subscription)
+    || (spec?.monthsIncluded ? addMonthsIso(spec.monthsIncluded) : addMonthsIso(1));
 
   let row = null;
   try {
-    if (session.subscription) {
+    if (session.subscription || session.mode === 'payment' || checkoutLooksPaid(session)) {
       row = await applyCheckoutSession(req, session);
-    } else if (checkoutLooksPaid(session)) {
-      row = await upsertBilling(req, {
-        userId: uid || userId,
-        stripeCustomerId: customerId,
-        stripeSubscriptionId: null,
-        plan,
-        status: 'active',
-        currentPeriodEnd: period,
-        cancelAtPeriodEnd: false,
-        source: 'stripe',
-        notes: 'Opened from a completed Checkout session.',
-      });
     }
   } catch (err) {
     console.warn('[billing] persist after checkout failed:', err.message);
   }
 
   const fromStore = publicBilling(row);
-  if (fromStore.paid) return fromStore;
+  if (fromStore.paid || (isAddonPlan(plan) && row)) return fromStore;
   if (checkoutLooksPaid(session) || session.subscription) {
-    return forcedPaid(plan, row, period);
+    return forcedPaid(isAddonPlan(plan) ? (row?.plan || 'monthly') : plan, row, period);
   }
   return billingForUser(req, userId);
 }

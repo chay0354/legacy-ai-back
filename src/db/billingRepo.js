@@ -18,6 +18,9 @@ function mapRow(row, extras = {}) {
     source: extras.source || row.source || null,
     notes: extras.notes || row.notes || null,
     credits: extras.credits || row.credits || [],
+    minutesRemaining: Number.isFinite(Number(extras.minutesRemaining))
+      ? Number(extras.minutesRemaining)
+      : Number(row.minutes_remaining) || 0,
   };
 }
 
@@ -46,6 +49,7 @@ function fromMeta(userId, billing) {
     source: billing.source || null,
     notes: billing.notes || null,
     credits: Array.isArray(billing.credits) ? billing.credits : [],
+    minutesRemaining: Number(billing.minutesRemaining) || 0,
   };
 }
 
@@ -81,6 +85,7 @@ async function writeAppMeta(req, mapped) {
         source: mapped.source || null,
         notes: mapped.notes || null,
         credits: mapped.credits || [],
+        minutesRemaining: mapped.minutesRemaining || 0,
       },
     },
   });
@@ -154,6 +159,9 @@ function extrasFrom(patch, existing = {}) {
     source: patch.source !== undefined ? patch.source : (existing.source || null),
     notes: patch.notes !== undefined ? patch.notes : (existing.notes || null),
     credits: Array.isArray(patch.credits) ? patch.credits : (existing.credits || []),
+    minutesRemaining: patch.minutesRemaining !== undefined
+      ? Number(patch.minutesRemaining) || 0
+      : (existing.minutesRemaining || 0),
   };
 }
 
