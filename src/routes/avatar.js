@@ -22,9 +22,16 @@ import {
   saveCreatorIdentity,
 } from '../services/genderProfile.js';
 import { assertVoiceSampleLongEnough } from '../services/audioDuration.js';
+import { assertArchivePaid, assertUserPaid } from '../services/stripeBilling.js';
+import { toPaymentError } from './billing.js';
 
 const router = Router();
 const BUCKET = 'legacy-media';
+
+function sendAvatarError(res, e, fallback = 500) {
+  if (e?.status === 402) return toPaymentError(res, e);
+  return res.status(e?.status || fallback).json({ error: e.message });
+}
 
 function resolveAnamLanguage(assets, override) {
   return normalizeAnamLanguage(override ?? assets?.metadata?.anam_language);
@@ -516,6 +523,7 @@ router.post('/voice-sample', async (req, res) => {
 
     const creator = await getOwnedCreator(req);
     if (!creator) return res.status(404).json({ error: 'No legacy found for this user' });
+    await assertUserPaid(req);
 
     const path = voiceSamplePath.trim();
     const { data: sampleFile, error: sampleErr } = await req.supabase.storage.from(BUCKET).download(path);
@@ -556,7 +564,7 @@ router.post('/voice-sample', async (req, res) => {
       voiceSampleUrl: await signed(req, saved.voice_sample_path),
     });
   } catch (e) {
-    res.status(500).json({ error: e.message });
+    sendAvatarError(res, e);
   }
 });
 
@@ -568,6 +576,7 @@ router.post('/voice', async (req, res) => {
 
     const creator = await getOwnedCreator(req);
     if (!creator) return res.status(404).json({ error: 'No legacy to attach a voice to' });
+    await assertUserPaid(req);
 
     if (!process.env.ELEVENLABS_API_KEY) {
       return res.status(503).json({ error: 'Voice cloning requires ELEVENLABS_API_KEY.' });
@@ -646,7 +655,7 @@ router.post('/voice', async (req, res) => {
       avatarReady: avatarReady(saved),
     });
   } catch (e) {
-    res.status(500).json({ error: e.message });
+    sendAvatarError(res, e);
   }
 });
 
@@ -981,6 +990,7 @@ router.post('/live/start', async (req, res) => {
 
     const creatorId = await resolveTalkCreatorId(req);
     if (!creatorId) return res.status(404).json({ error: 'No legacy specified' });
+    await assertArchivePaid(req, creatorId);
 
     // The creator's own Anam face + cloned voice. No stock-voice fallback.
     // Provision on demand if the owner is calling; viewers need the owner to finish Studio.
@@ -1093,6 +1103,7 @@ router.post('/live/start', async (req, res) => {
       videoProfile: anamBuildSessionOptions(),
     });
   } catch (e) {
+    if (e?.status === 402) return sendAvatarError(res, e);
     console.error('[avatar/live/start] failed:', e);
     res.status(502).json({ error: e.message });
   }
@@ -1206,6 +1217,7 @@ router.post('/provision', async (req, res) => {
   try {
     const creator = await getOwnedCreator(req);
     if (!creator) return res.status(404).json({ error: 'No legacy found for this user' });
+    await assertUserPaid(req);
 
     let assets = await getAssets(req, creator.id);
     if (anamReady(assets)) {
@@ -1252,6 +1264,7 @@ router.post('/provision', async (req, res) => {
     assets = await getAssets(req, creator.id);
     return res.json(buildProvisionResponse(assets));
   } catch (e) {
+    if (e?.status === 402) return sendAvatarError(res, e);
     console.error('[avatar/provision] failed:', e);
     const status = e.message.includes('first') ? 409 : 502;
     res.status(status).json({ error: e.message });

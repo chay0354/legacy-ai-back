@@ -67,5 +67,10 @@ export async function ensureSchema() {
   } catch {
     /* already applied */
   }
+  try {
+    await applyMigration(db, '20260914180000_billing.sql');
+  } catch {
+    /* already applied */
+  }
   return true;
 }

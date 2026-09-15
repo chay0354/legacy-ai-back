@@ -2,6 +2,8 @@ import { Router } from 'express';
 import { createClient } from '@supabase/supabase-js';
 import { makeAccessStore, lookupInvitationByToken } from '../db/accessRepo.js';
 import { ROLES, can, permissionsFor } from '../services/access.js';
+import { assertArchivePaid, billingForUser } from '../services/stripeBilling.js';
+import { toPaymentError } from './billing.js';
 
 const router = Router();
 
@@ -26,12 +28,14 @@ async function resolveContext(req, explicitCreatorId) {
 router.get('/me', async (req, res) => {
   try {
     const s = store(req);
-    const [memberships, pendingInvitations] = await Promise.all([
+    const [memberships, pendingInvitations, billing] = await Promise.all([
       s.listMembershipsForUser(req.user.id),
       req.userEmail ? s.listPendingInvitationsForEmail(req.userEmail) : [],
+      billingForUser(req, req.user.id).catch(() => ({ plan: 'none', status: 'none', paid: false })),
     ]);
     res.json({
       user: { id: req.user.id, email: req.userEmail, name: req.user.user_metadata?.full_name || null },
+      billing,
       memberships: memberships.map((m) => ({
         creatorId: m.creator_id,
         role: m.role,
@@ -91,9 +95,11 @@ router.post('/invitations', async (req, res) => {
       return res.status(403).json({ error: 'Only the creator can invite administrators' });
     }
 
+    await assertArchivePaid(req, creatorId);
     const invitation = await s.createInvitation(creatorId, targetRole, req.user.id);
     res.status(201).json({ invitation });
   } catch (err) {
+    if (err.status === 402) return toPaymentError(res, err);
     res.status(500).json({ error: err.message });
   }
 });

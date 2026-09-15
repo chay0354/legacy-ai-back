@@ -13,6 +13,8 @@ import {
   getProfilePg,
 } from '../db/legacyRepo.js';
 import { processInterviewSession } from '../services/interviewProcessor.js';
+import { assertUserPaid } from '../services/stripeBilling.js';
+import { toPaymentError } from './billing.js';
 import { conductorTurn } from '../services/interviewConductor.js';
 import { openAiConfigured, transcribeWhisper } from '../services/openai.js';
 import { speakInterviewer, interviewerTtsConfigured } from '../services/interviewVoice.js';
@@ -408,6 +410,7 @@ async function loadPriorStories(req, creatorId, currentStage, usePg, excludeSess
 router.get('/session', async (req, res) => {
   try {
     await assertInterviewCreator(req);
+    await assertUserPaid(req);
     const usePg = !!getPool();
     const requestedStage = req.query.stage || null;
 

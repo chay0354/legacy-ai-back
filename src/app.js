@@ -7,6 +7,9 @@ import interviewRouter from './routes/interview.js';
 import accessRouter, { previewInvite } from './routes/access.js';
 import avatarRouter from './routes/avatar.js';
 import authRouter from './routes/auth.js';
+import billingRouter, { billingWebhookHandler } from './routes/billing.js';
+import { publicPlans } from './services/plans.js';
+import { stripeConfigured } from './services/stripeBilling.js';
 import { ensureSchema, getPool } from './db/pool.js';
 
 function corsOrigins() {
@@ -66,6 +69,7 @@ export function createApp() {
 
   app.use(cors(corsOptions));
   app.options(/.*/, cors(corsOptions));
+  app.post('/api/billing/webhook', ...billingWebhookHandler());
   app.use(express.json({ limit: '12mb' }));
 
   const supabase = createClient(
@@ -86,6 +90,10 @@ export function createApp() {
   });
 
   app.use('/api/auth', authRouter);
+  app.get('/api/billing/plans', (_req, res) => {
+    res.json({ plans: publicPlans(), configured: stripeConfigured() });
+  });
+  app.use('/api/billing', requireAuth, billingRouter);
 
   app.get('/api/supabase-check', async (_req, res) => {
     try {
