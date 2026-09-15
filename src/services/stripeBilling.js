@@ -1,7 +1,7 @@
 import Stripe from 'stripe';
 import {
   addonOffer, getPlan, isAddonPlan, isPaidStatus, planCanInterview, planCanViewArchive,
-  planIdFromPriceId, planUsesMinutes, priceIdForPlan,
+  planIdFromPriceId, planUsesMinutes, priceIdForPlan, setResolvedPrice,
 } from './plans.js';
 import {
   getBillingByCustomerId, getBillingByUserId, ownerUserIdForCreator, upsertBilling,
@@ -14,13 +14,34 @@ export function stripeClient() {
 }
 
 export function stripeConfigured() {
-  return Boolean(process.env.STRIPE_SECRET_KEY && (
-    priceIdForPlan('monthly')
-    || priceIdForPlan('archive')
-    || priceIdForPlan('preserve')
-    || priceIdForPlan('setup')
-    || priceIdForPlan('family')
-  ));
+  return Boolean(process.env.STRIPE_SECRET_KEY);
+}
+
+/** Env first; if production never got the new price IDs, find them on the Stripe product. */
+export async function resolvePriceId(planId) {
+  const fromEnv = priceIdForPlan(planId);
+  if (fromEnv) return fromEnv;
+  if (!process.env.STRIPE_SECRET_KEY || !getPlan(planId)) return '';
+  try {
+    const plan = getPlan(planId);
+    const products = await stripeClient().products.search({
+      query: `metadata['legacy_plan']:'${planId}' AND active:'true'`,
+    });
+    const product = products.data[0];
+    if (!product) return '';
+    const prices = await stripeClient().prices.list({ product: product.id, active: true, limit: 20 });
+    const match = prices.data.find((p) =>
+      p.unit_amount === plan.amount
+      && p.currency === plan.currency
+      && (plan.interval ? p.recurring?.interval === plan.interval : !p.recurring),
+    ) || prices.data[0];
+    if (!match?.id) return '';
+    setResolvedPrice(planId, match.id);
+    return match.id;
+  } catch (e) {
+    console.warn('[billing] could not resolve Stripe price for', planId, e.message);
+    return '';
+  }
 }
 
 export function publicBilling(row) {
@@ -64,6 +85,15 @@ async function refreshBillingFromStripe(req, userId) {
       }
     }
     if (!customerId) return existing;
+    const sessions = await stripe.checkout.sessions.list({ customer: customerId, limit: 15 });
+    const paidSession = sessions.data.find((s) => checkoutLooksPaid(s));
+    if (paidSession) {
+      const full = await stripe.checkout.sessions.retrieve(paidSession.id, {
+        expand: ['subscription', 'line_items.data.price'],
+      });
+      const row = await applyCheckoutSession(req, full);
+      if (isPaidStatus(row?.status, row?.currentPeriodEnd)) return row;
+    }
     const sub = await subscriptionForCustomer(customerId);
     if (!sub) return existing;
     return persistSubscription(req, {
@@ -202,7 +232,7 @@ export async function rememberCustomer(req, userId, customerId) {
 function checkoutLooksPaid(session) {
   const payment = String(session?.payment_status || '').toLowerCase();
   const status = String(session?.status || '').toLowerCase();
-  return payment === 'paid' || status === 'complete';
+  return payment === 'paid' || payment === 'no_payment_required' || status === 'complete';
 }
 
 function paidEnoughStatus(status, checkoutPaid) {
@@ -309,7 +339,10 @@ export async function applyCheckoutSession(req, session) {
     || session.client_reference_id
     || (await userIdFromCustomer(customerId));
   if (!userId) throw new Error('Checkout session missing userId');
-  const plan = session.metadata?.plan || planIdFromPriceId(session.metadata?.priceId) || 'monthly';
+  const plan = session.metadata?.plan
+    || planIdFromPriceId(session.metadata?.priceId)
+    || planIdFromPriceId(session.line_items?.data?.[0]?.price?.id)
+    || 'monthly';
   const paid = checkoutLooksPaid(session);
 
   if (session.mode === 'payment' || isAddonPlan(plan) || getPlan(plan)?.checkoutMode === 'payment') {
@@ -367,7 +400,7 @@ function forcedPaid(plan, row, period) {
 export async function syncCheckoutSession(req, sessionId, userId) {
   const stripe = stripeClient();
   const session = await stripe.checkout.sessions.retrieve(sessionId, {
-    expand: ['subscription'],
+    expand: ['subscription', 'line_items.data.price'],
   });
   if (typeof session.subscription === 'string') {
     try {

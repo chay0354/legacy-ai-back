@@ -133,14 +133,20 @@ export function priceEnvName(planId) {
   return PRICE_ENV[planId] || PRICE_ENV.monthly;
 }
 
+const resolvedPrices = {};
+
+export function setResolvedPrice(planId, priceId) {
+  if (planId && priceId) resolvedPrices[planId] = priceId;
+}
+
 export function priceIdForPlan(planId) {
-  return process.env[priceEnvName(planId)] || '';
+  return process.env[priceEnvName(planId)] || resolvedPrices[planId] || '';
 }
 
 export function planIdFromPriceId(priceId) {
   if (!priceId) return null;
   for (const id of PLAN_IDS) {
-    if (priceId === process.env[PRICE_ENV[id]]) return id;
+    if (priceId === process.env[PRICE_ENV[id]] || priceId === resolvedPrices[id]) return id;
   }
   return null;
 }

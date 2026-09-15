@@ -2,7 +2,7 @@ import { Router } from 'express';
 import express from 'express';
 import {
   checkoutPlanId, getPlan, isAddonPlan, isPaidStatus, planCanViewArchive,
-  PLAN_IDS, priceIdForPlan, publicPlans,
+  PLAN_IDS, publicPlans,
 } from '../services/plans.js';
 import {
   applyCheckoutSession,
@@ -10,6 +10,7 @@ import {
   billingForUser,
   publicBilling,
   rememberCustomer,
+  resolvePriceId,
   stripeClient,
   stripeConfigured,
   syncCheckoutSession,
@@ -86,8 +87,7 @@ router.get('/plans', (_req, res) => {
 
 router.get('/status', async (req, res) => {
   try {
-    const row = await getBillingByUserId(req, req.user.id);
-    res.json(publicBilling(row));
+    res.json(await billingForUser(req, req.user.id));
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
@@ -99,7 +99,7 @@ router.post('/checkout', async (req, res) => {
     const planId = checkoutPlanId(req.body?.plan);
     if (!planId) return res.status(400).json({ error: 'Choose Set up, Monthly, Preserve, or a 30 minute add-on.' });
     const spec = getPlan(planId);
-    const priceId = priceIdForPlan(planId);
+    const priceId = await resolvePriceId(planId);
     if (!priceId) return res.status(503).json({ error: `Missing Stripe price for ${planId}` });
 
     const stripe = stripeClient();
