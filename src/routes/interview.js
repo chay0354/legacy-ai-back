@@ -746,10 +746,6 @@ router.post('/session/:sessionId/complete', async (req, res) => {
   }
 });
 
-function archiveHasProgress(creator) {
-  return Number(creator?.avatar_level) > 0 || Number(creator?.completion_score) > 0;
-}
-
 function lockedArchivePayload(creator, role) {
   return {
     locked: true,
@@ -805,10 +801,7 @@ router.get('/profile', async (req, res) => {
       }
       if (stripeConfigured() && !(await ownerCanViewArchive(req, creatorId))) {
         const stub = await getProfilePg(creatorId).catch(() => ({ creator: { id: creatorId } }));
-        const creator = stub.creator || { id: creatorId };
-        if (archiveHasProgress(creator)) {
-          return res.json(lockedArchivePayload(creator, role));
-        }
+        return res.json(lockedArchivePayload(stub.creator || { id: creatorId }, role));
       }
       const profile = await getProfilePg(creatorId);
       const gallery = await Promise.all(
@@ -842,7 +835,7 @@ router.get('/profile', async (req, res) => {
     if (!creatorRow) return res.status(404).json({ error: 'Legacy not found' });
 
     const creatorId = creatorRow.id;
-    if (stripeConfigured() && !(await ownerCanViewArchive(req, creatorId)) && archiveHasProgress(creatorRow)) {
+    if (stripeConfigured() && !(await ownerCanViewArchive(req, creatorId))) {
       return res.json(lockedArchivePayload(creatorRow, role));
     }
     const [coverage, memories, relationships, values, wisdom, threads, personality, sessions, latestSession, galleryRows] = await Promise.all([
