@@ -1,6 +1,9 @@
 import { Router } from 'express';
 import express from 'express';
-import { checkoutPlanId, getPlan, PLAN_IDS, priceIdForPlan, publicPlans } from '../services/plans.js';
+import {
+  checkoutPlanId, getPlan, isAddonPlan, isPaidStatus, planCanViewArchive,
+  PLAN_IDS, priceIdForPlan, publicPlans,
+} from '../services/plans.js';
 import {
   applyCheckoutSession,
   applySubscriptionEvent,
@@ -101,6 +104,13 @@ router.post('/checkout', async (req, res) => {
 
     const stripe = stripeClient();
     const existing = await getBillingByUserId(req, req.user.id);
+    if (isAddonPlan(planId)) {
+      if (!isPaidStatus(existing?.status, existing?.currentPeriodEnd) || !planCanViewArchive(existing?.plan)) {
+        return res.status(400).json({
+          error: 'The 30 minute add-on is for an active Monthly or Set up plan. Choose a plan first.',
+        });
+      }
+    }
     let customerId = existing?.stripeCustomerId || null;
 
     if (!customerId) {
@@ -124,8 +134,10 @@ router.post('/checkout', async (req, res) => {
       customer: customerId,
       client_reference_id: req.user.id,
       line_items: [{ price: priceId, quantity: 1 }],
-      success_url: `${front}/billing/success?session_id={CHECKOUT_SESSION_ID}`,
-      cancel_url: `${front}/pricing`,
+      success_url: isAddonPlan(planId)
+        ? `${front}/billing/success?session_id={CHECKOUT_SESSION_ID}&addon=1`
+        : `${front}/billing/success?session_id={CHECKOUT_SESSION_ID}`,
+      cancel_url: isAddonPlan(planId) ? `${front}/settings` : `${front}/pricing`,
       allow_promotion_codes: true,
       metadata: { userId: req.user.id, plan: planId, priceId },
       // The site quotes USD, so Checkout must charge USD rather than a converted local amount.

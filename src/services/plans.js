@@ -74,7 +74,7 @@ export const PLANS = {
     minutes: 30,
     canInterview: false,
     canViewArchive: false,
-    public: true,
+    public: false,
     primary: false,
     lines: [
       'Add 30 minutes to an active Monthly or Set up plan',
@@ -161,6 +161,22 @@ export function planCanInterview(id) {
 
 export function planCanViewArchive(id) {
   return Boolean(getPlan(id)?.canViewArchive);
+}
+
+/** Monthly and Set up spend the included minutes. Complimentary Archive/Family do not. */
+export function planUsesMinutes(id) {
+  return id === 'monthly' || id === 'setup';
+}
+
+export function addonOffer() {
+  const p = PLANS.addon;
+  return {
+    id: p.id,
+    name: p.name,
+    displayPrice: formatMoney(p.amount, p.currency),
+    minutes: p.minutes,
+    amount: p.amount,
+  };
 }
 
 const ACTIVE = new Set(['active', 'trialing']);

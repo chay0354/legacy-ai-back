@@ -1,7 +1,7 @@
 import Stripe from 'stripe';
 import {
-  getPlan, isAddonPlan, isPaidStatus, planCanInterview, planCanViewArchive,
-  planIdFromPriceId, priceIdForPlan,
+  addonOffer, getPlan, isAddonPlan, isPaidStatus, planCanInterview, planCanViewArchive,
+  planIdFromPriceId, planUsesMinutes, priceIdForPlan,
 } from './plans.js';
 import {
   getBillingByCustomerId, getBillingByUserId, ownerUserIdForCreator, upsertBilling,
@@ -26,6 +26,9 @@ export function stripeConfigured() {
 export function publicBilling(row) {
   const paid = isPaidStatus(row?.status, row?.currentPeriodEnd);
   const plan = paid ? (row.plan || 'none') : 'none';
+  const usesMinutes = paid && planUsesMinutes(plan);
+  const minutesRemaining = paid ? (Number(row?.minutesRemaining) || 0) : 0;
+  const canViewArchive = paid && planCanViewArchive(plan);
   return {
     plan,
     status: row?.status || 'none',
@@ -36,9 +39,13 @@ export function publicBilling(row) {
     source: row?.source || null,
     notes: row?.notes || null,
     credits: row?.credits || [],
-    minutesRemaining: paid ? (Number(row?.minutesRemaining) || 0) : 0,
+    minutesRemaining,
+    usesMinutes,
+    minutesExhausted: usesMinutes && minutesRemaining <= 0,
     canInterview: paid && planCanInterview(plan),
-    canViewArchive: paid && planCanViewArchive(plan),
+    canViewArchive,
+    canBuyAddon: canViewArchive,
+    addon: canViewArchive ? addonOffer() : null,
   };
 }
 
@@ -84,11 +91,15 @@ export async function ownerIsPaid(req, creatorId) {
   return billing.paid;
 }
 
-function paymentError(message) {
+function paymentError(message, code = 'PAYMENT_REQUIRED') {
   const err = new Error(message);
   err.status = 402;
-  err.code = 'PAYMENT_REQUIRED';
+  err.code = code;
   return err;
+}
+
+function minutesError() {
+  return paymentError('Your minutes are used. Add 30 minutes in Settings to continue.', 'MINUTES_REQUIRED');
 }
 
 /** Owner starting the interview (Preserve is enough). */
@@ -98,6 +109,7 @@ export async function assertUserPaid(req) {
   if (!billing.canInterview) {
     throw paymentError('Choose a plan to start the interview.');
   }
+  if (billing.minutesExhausted) throw minutesError();
   return billing;
 }
 
@@ -125,9 +137,42 @@ export async function ownerCanViewArchive(req, creatorId) {
 /** Live avatar and family invitations need a plan that opens the archive. */
 export async function assertArchivePaid(req, creatorId) {
   if (!stripeConfigured()) return;
-  if (!(await ownerCanViewArchive(req, creatorId))) {
+  const ownerId = await ownerUserIdForCreator(req, creatorId);
+  if (!ownerId) throw paymentError('This archive needs Monthly or Set up for live calls and family invitations.');
+  const billing = await billingForUser(req, ownerId);
+  if (!billing.canViewArchive) {
     throw paymentError('This archive needs Monthly or Set up for live calls and family invitations.');
   }
+}
+
+export async function assertOwnerHasMinutes(req, creatorId) {
+  if (!stripeConfigured()) return;
+  const ownerId = await ownerUserIdForCreator(req, creatorId);
+  if (!ownerId) return;
+  const billing = await billingForUser(req, ownerId);
+  if (billing.minutesExhausted) throw minutesError();
+}
+
+export async function consumeMinutes(req, userId, durationSeconds) {
+  const existing = await getBillingByUserId(req, userId);
+  if (!existing || !planUsesMinutes(existing.plan)) return existing;
+  if (!isPaidStatus(existing.status, existing.currentPeriodEnd)) return existing;
+  const used = Math.max(1, Math.ceil((Number(durationSeconds) || 0) / 60));
+  const next = Math.max(0, (Number(existing.minutesRemaining) || 0) - used);
+  return upsertBilling(req, {
+    userId,
+    stripeCustomerId: existing.stripeCustomerId,
+    stripeSubscriptionId: existing.stripeSubscriptionId,
+    plan: existing.plan,
+    status: existing.status,
+    priceId: existing.priceId,
+    currentPeriodEnd: existing.currentPeriodEnd,
+    cancelAtPeriodEnd: existing.cancelAtPeriodEnd,
+    source: existing.source,
+    notes: existing.notes,
+    credits: existing.credits,
+    minutesRemaining: next,
+  });
 }
 
 /** Recent Stripe API versions report the renewal date on the subscription item. */

@@ -22,7 +22,7 @@ import {
   saveCreatorIdentity,
 } from '../services/genderProfile.js';
 import { assertVoiceSampleLongEnough } from '../services/audioDuration.js';
-import { assertArchivePaid, assertCanViewArchive, assertUserPaid } from '../services/stripeBilling.js';
+import { assertArchivePaid, assertCanViewArchive, assertOwnerHasMinutes, assertUserPaid } from '../services/stripeBilling.js';
 import { toPaymentError } from './billing.js';
 
 const router = Router();
@@ -992,6 +992,7 @@ router.post('/live/start', async (req, res) => {
     const creatorId = await resolveTalkCreatorId(req);
     if (!creatorId) return res.status(404).json({ error: 'No legacy specified' });
     await assertArchivePaid(req, creatorId);
+    await assertOwnerHasMinutes(req, creatorId);
 
     // The creator's own Anam face + cloned voice. No stock-voice fallback.
     // Provision on demand if the owner is calling; viewers need the owner to finish Studio.

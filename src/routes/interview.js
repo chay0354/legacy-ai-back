@@ -13,7 +13,7 @@ import {
   getProfilePg,
 } from '../db/legacyRepo.js';
 import { processInterviewSession } from '../services/interviewProcessor.js';
-import { assertUserPaid, ownerCanViewArchive, stripeConfigured } from '../services/stripeBilling.js';
+import { assertUserPaid, consumeMinutes, ownerCanViewArchive, stripeConfigured } from '../services/stripeBilling.js';
 import { conductorTurn } from '../services/interviewConductor.js';
 import { openAiConfigured, transcribeWhisper } from '../services/openai.js';
 import { speakInterviewer, interviewerTtsConfigured } from '../services/interviewVoice.js';
@@ -726,6 +726,12 @@ router.post('/session/:sessionId/complete', async (req, res) => {
       .select('avatar_level, completion_score')
       .eq('id', creator.id)
       .maybeSingle();
+
+    try {
+      await consumeMinutes(req, req.user.id, durationSeconds);
+    } catch (e) {
+      console.warn('[billing] could not consume interview minutes:', e.message);
+    }
 
     res.json({
       success: true,
