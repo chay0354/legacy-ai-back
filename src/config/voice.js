@@ -3,7 +3,7 @@
 export function elevenLabsVoiceSettings() {
   return {
     stability: Number(process.env.ELEVENLABS_STABILITY ?? 0.4),
-    similarity_boost: Number(process.env.ELEVENLABS_SIMILARITY_BOOST ?? 0.75),
+    similarity_boost: Number(process.env.ELEVENLABS_SIMILARITY_BOOST ?? 0.82),
     style: Number(process.env.ELEVENLABS_STYLE ?? 0.15),
     use_speaker_boost: process.env.ELEVENLABS_SPEAKER_BOOST !== 'false',
   };

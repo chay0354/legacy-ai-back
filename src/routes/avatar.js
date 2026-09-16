@@ -8,11 +8,12 @@ import {
   deleteAvatar as anamDeleteAvatar,
   deleteVoice as anamDeleteVoice,
   getVoice as anamGetVoice,
-  createAvatarFromImageUrl as anamCreateAvatar,
+  createAvatar as anamCreateAvatar,
   cloneVoice as anamCloneVoice,
   createSessionToken as anamCreateSessionToken,
   buildSessionOptions as anamBuildSessionOptions,
   defaultAvatarModel as anamDefaultAvatarModel,
+  voiceEnhanceEnabled as anamVoiceEnhanceEnabled,
 } from '../services/anam.js';
 import { makeAccessStore } from '../db/accessRepo.js';
 import { normalizeAnamLanguage } from '../anamLanguages.js';
@@ -149,12 +150,15 @@ function anamVoiceReady(assets) {
   if (meta.anam_voice_sample_path !== assets.voice_sample_path) return false;
   const selected = resolveAnamLanguage(assets);
   if (!meta.anam_voice_language || meta.anam_voice_language !== selected) return false;
+  // Old clones used enhance=true, which washes out identity.
+  if (meta.anam_voice_enhance !== anamVoiceEnhanceEnabled()) return false;
   return true;
 }
 
 /** True when the Anam live face AND cloned voice are provisioned. Face alone is not enough. */
 function anamReady(assets) {
-  return Boolean(assets?.metadata?.anam_avatar_id && anamVoiceReady(assets));
+  const meta = assets?.metadata || {};
+  return Boolean(meta.anam_avatar_id && meta.anam_avatar_source === 'upload' && anamVoiceReady(assets));
 }
 
 function anamDisplayName(creator) {
@@ -179,15 +183,15 @@ async function freeAnamAvatarSlots(creator, keepId = null) {
   }
 }
 
-async function createAnamAvatarWithSlotRetry(creator, portraitUrl) {
+async function createAnamAvatarWithSlotRetry(creator, portrait) {
   const displayName = anamDisplayName(creator);
   try {
-    return await anamCreateAvatar({ displayName, imageUrl: portraitUrl });
+    return await anamCreateAvatar({ displayName, ...portrait });
   } catch (e) {
     if (e.status !== 403 || !/one-shot avatars/i.test(e.message)) throw e;
     console.warn('[avatar/anam] avatar slot full — cleaning stale one-shots for creator');
     await freeAnamAvatarSlots(creator);
-    return anamCreateAvatar({ displayName, imageUrl: portraitUrl });
+    return anamCreateAvatar({ displayName, ...portrait });
   }
 }
 
@@ -209,12 +213,15 @@ async function provisionAnam(req, creator) {
 
   const language = resolveAnamLanguage(assets);
   const avatarModel = anamDefaultAvatarModel();
+  const voiceEnhance = anamVoiceEnhanceEnabled();
   const haveAvatar = meta.anam_avatar_id
     && meta.anam_avatar_portrait_path === portraitKey
-    && meta.anam_avatar_model === avatarModel;
+    && meta.anam_avatar_model === avatarModel
+    && meta.anam_avatar_source === 'upload';
   const haveVoice = meta.anam_voice_id
     && meta.anam_voice_sample_path === voiceKey
-    && meta.anam_voice_language === language;
+    && meta.anam_voice_language === language
+    && meta.anam_voice_enhance === voiceEnhance;
   if (haveAvatar && haveVoice) return assets;
 
   await upsertAssets(req, creator.id, {
@@ -225,24 +232,42 @@ async function provisionAnam(req, creator) {
     let anamAvatarId = haveAvatar ? meta.anam_avatar_id : null;
     let anamVoiceId = haveVoice ? meta.anam_voice_id : null;
 
-    // Face — Anam downloads the signed portrait URL and builds the live avatar.
+    // Face — upload the stored portrait bytes so Anam does not fetch a signed URL.
     if (!anamAvatarId) {
+      const { data: portraitFile, error: portraitErr } = await req.supabase.storage.from(BUCKET).download(portraitKey);
+      if (portraitErr || !portraitFile) throw new Error(`Could not read the portrait photo: ${portraitErr?.message || 'not found'}`);
+      const portraitBuffer = Buffer.from(await portraitFile.arrayBuffer());
+      if (!portraitBuffer.length) throw new Error('Could not read the portrait photo.');
+      const ext = (portraitKey.split('.').pop() || 'jpg').toLowerCase();
+      const portraitType = ext === 'png' ? 'image/png' : ext === 'webp' ? 'image/webp' : 'image/jpeg';
       const portraitUrl = await signed(req, portraitKey);
-      if (!portraitUrl) throw new Error('Could not read the portrait photo.');
-      // Portrait or model changed — drop the previous one-shot so Free-plan slot limits aren't hit.
-      if (meta.anam_avatar_id && (meta.anam_avatar_portrait_path !== portraitKey || meta.anam_avatar_model !== avatarModel)) {
+
+      // Portrait / model / upload path changed — drop the previous one-shot so slot limits aren't hit.
+      if (meta.anam_avatar_id && (
+        meta.anam_avatar_portrait_path !== portraitKey
+        || meta.anam_avatar_model !== avatarModel
+        || meta.anam_avatar_source !== 'upload'
+      )) {
         try {
           await anamDeleteAvatar(meta.anam_avatar_id);
         } catch (e) {
           console.warn('[avatar/anam] old avatar delete failed:', e.message);
         }
       }
-      anamAvatarId = await createAnamAvatarWithSlotRetry(creator, portraitUrl);
+      anamAvatarId = await createAnamAvatarWithSlotRetry(creator, {
+        imageBuffer: portraitBuffer,
+        contentType: portraitType,
+        filename: `portrait.${ext === 'png' ? 'png' : ext === 'webp' ? 'webp' : 'jpg'}`,
+        imageUrl: portraitUrl,
+      });
     }
 
     // Voice — clone from the recorded sample stored in Supabase (language from Studio selector).
     if (!anamVoiceId) {
-      if (meta.anam_voice_id && meta.anam_voice_language !== language) {
+      if (meta.anam_voice_id && (
+        meta.anam_voice_language !== language
+        || meta.anam_voice_enhance !== voiceEnhance
+      )) {
         try {
           await anamDeleteVoice(meta.anam_voice_id);
         } catch (e) {
@@ -272,9 +297,11 @@ async function provisionAnam(req, creator) {
         anam_avatar_id: anamAvatarId,
         anam_avatar_portrait_path: portraitKey,
         anam_avatar_model: avatarModel,
+        anam_avatar_source: 'upload',
         anam_voice_id: anamVoiceId,
         anam_voice_sample_path: voiceKey,
         anam_voice_language: language,
+        anam_voice_enhance: voiceEnhance,
         anam_provisioned_at: new Date().toISOString(),
       },
     });
@@ -306,9 +333,11 @@ function clearedAnamMetadata(meta = {}) {
     anam_avatar_id: null,
     anam_avatar_portrait_path: null,
     anam_avatar_model: null,
+    anam_avatar_source: null,
     anam_voice_id: null,
     anam_voice_sample_path: null,
     anam_voice_language: null,
+    anam_voice_enhance: null,
     anam_provisioned_at: null,
   };
 }
@@ -319,6 +348,7 @@ function clearedAnamVoiceMetadata(meta = {}) {
     anam_voice_id: null,
     anam_voice_sample_path: null,
     anam_voice_language: null,
+    anam_voice_enhance: null,
     anam_status: meta.anam_avatar_id ? 'none' : (meta.anam_status || 'none'),
     anam_error: null,
   };
@@ -641,6 +671,7 @@ router.post('/voice', async (req, res) => {
         anam_voice_id: null,
         anam_voice_sample_path: null,
         anam_voice_language: null,
+        anam_voice_enhance: null,
         anam_status: prevMeta.anam_avatar_id ? 'none' : (prevMeta.anam_status || 'none'),
       },
     });
@@ -1297,6 +1328,7 @@ router.put('/assets', async (req, res) => {
           anam_status: 'none',
           anam_avatar_id: null,
           anam_avatar_portrait_path: null,
+          anam_avatar_source: null,
         };
       }
     }

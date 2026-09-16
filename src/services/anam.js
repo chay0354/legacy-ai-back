@@ -48,9 +48,16 @@ export function buildSessionOptions() {
     opts.videoWidth = parseInt(w, 10);
     opts.videoHeight = parseInt(h, 10);
   } else if (model.startsWith('cara-4')) {
-    // Cara 4 native landscape. With videoQuality=auto, Anam ABR can still adapt bitrate.
-    opts.videoWidth = 1152;
-    opts.videoHeight = 768;
+    // Live UI is a tall portrait frame. Landscape 1152×768 in a 4:5/2:3 box
+    // crops the face twice and looks warped. Cara 4 portrait is 768×1152.
+    const orient = (process.env.ANAM_VIDEO_ORIENTATION || 'portrait').toLowerCase();
+    if (orient === 'landscape') {
+      opts.videoWidth = 1152;
+      opts.videoHeight = 768;
+    } else {
+      opts.videoWidth = 768;
+      opts.videoHeight = 1152;
+    }
   } else {
     opts.videoWidth = 720;
     opts.videoHeight = 480;
@@ -115,6 +122,16 @@ export async function getVoice(voiceId) {
   return parse(res, 'get voice');
 }
 
+export function voiceEnhanceEnabled() {
+  return /^(1|true|yes)$/i.test(process.env.ANAM_VOICE_ENHANCE || '');
+}
+
+function extractAvatarId(data) {
+  const id = data?.id;
+  if (!id) throw new Error('Anam did not return an avatar id');
+  return id;
+}
+
 export async function createAvatarFromImageUrl({ displayName, imageUrl }) {
   const res = await fetch(`${BASE_URL}/v1/avatars`, {
     method: 'POST',
@@ -129,13 +146,44 @@ export async function createAvatarFromImageUrl({ displayName, imageUrl }) {
       avatarModel: defaultAvatarModel(),
     }),
   });
-  const data = await parse(res, 'create avatar');
-  const id = data?.id;
-  if (!id) throw new Error('Anam did not return an avatar id');
-  return id;
+  return extractAvatarId(await parse(res, 'create avatar'));
 }
 
-const ANAM_INLINE_VOICE_MAX_BYTES = 3_500_000;
+/** Upload the portrait bytes so Anam never has to fetch a signed URL (those can expire or 404). */
+export async function createAvatarFromImageFile({ displayName, buffer, contentType = 'image/jpeg', filename = 'portrait.jpg' }) {
+  const form = new FormData();
+  form.append('displayName', displayName.slice(0, 50));
+  form.append('avatarModel', defaultAvatarModel());
+  form.append('imageFile', new Blob([new Uint8Array(buffer)], { type: contentType }), filename);
+
+  const res = await fetch(`${BASE_URL}/v1/avatars`, {
+    method: 'POST',
+    headers: {
+      Authorization: `Bearer ${apiKey()}`,
+      Accept: 'application/json',
+    },
+    body: form,
+  });
+  return extractAvatarId(await parse(res, 'create avatar'));
+}
+
+export async function createAvatar({ displayName, imageUrl, imageBuffer, contentType, filename }) {
+  if (imageBuffer) {
+    try {
+      return await createAvatarFromImageFile({
+        displayName,
+        buffer: imageBuffer,
+        contentType,
+        filename,
+      });
+    } catch (e) {
+      if (!imageUrl) throw e;
+      console.warn('[anam] image upload failed, falling back to URL:', e.message);
+    }
+  }
+  if (!imageUrl) throw new Error('A portrait image is required to create the live avatar.');
+  return createAvatarFromImageUrl({ displayName, imageUrl });
+}
 
 async function cloneVoiceViaPresigned({ name, buffer, contentType, filename, language }) {
   const signed = await fetch(`${BASE_URL}/v1/voices/presigned-upload`, {
@@ -177,32 +225,15 @@ async function cloneVoiceViaPresigned({ name, buffer, contentType, filename, lan
       name: name.slice(0, 50),
       audioKey,
       language: language || 'en',
-      enhance: true,
+      enhance: voiceEnhanceEnabled(),
     }),
   });
   return parse(res, 'create voice');
 }
 
-/** Clone a voice from an audio sample. Large clips use Anam's presigned upload (~4.5MB multipart limit). */
+/** Clone a voice from an audio sample. Always use presigned upload so 44.1kHz WAVs are not truncated. */
 export async function cloneVoice({ name, buffer, contentType = 'audio/wav', filename = 'voice-sample.wav', language = 'en' }) {
-  const bytes = Buffer.isBuffer(buffer) ? buffer.length : buffer.byteLength;
-  let data;
-  if (bytes > ANAM_INLINE_VOICE_MAX_BYTES) {
-    data = await cloneVoiceViaPresigned({ name, buffer, contentType, filename, language });
-  } else {
-    const form = new FormData();
-    form.append('name', name.slice(0, 50));
-    form.append('language', language || 'en');
-    form.append('enhance', 'true');
-    form.append('audioFile', new Blob([buffer], { type: contentType }), filename);
-
-    const res = await fetch(`${BASE_URL}/v1/voices`, {
-      method: 'POST',
-      headers: { Authorization: `Bearer ${apiKey()}` },
-      body: form,
-    });
-    data = await parse(res, 'create voice');
-  }
+  const data = await cloneVoiceViaPresigned({ name, buffer, contentType, filename, language });
   const id = data?.id;
   if (!id) throw new Error('Anam did not return a voice id');
   return id;
