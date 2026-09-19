@@ -78,6 +78,12 @@ function formatAnsweredFacts(topics) {
   if (/\b(brother|sister|siblings|only child|אח|אחות|אחים)\b/i.test(text)) {
     facts.push('siblings — already discussed; do not ask if they had brothers or sisters');
   }
+  if (/\b(work|job|career|army|military|school|university|college|עבודה|צבא|בית ספר)\b/i.test(text)) {
+    facts.push('work / school / service — already discussed; do not restart that chapter');
+  }
+  if (/\b(married|husband|wife|partner|wedding|נישא|בעל|אישה)\b/i.test(text)) {
+    facts.push('marriage / partner — already discussed');
+  }
   if (!facts.length) return '';
   return `ALREADY ANSWERED — DO NOT ASK AGAIN:
 ${facts.map((f) => `- ${f}`).join('\n')}`;
@@ -257,6 +263,8 @@ NEXT MOVE (REQUIRED every spoken turn — never leave them hanging):
 - After a new topic loads, your first spoken turn MUST ask that topic now.
 - Follow-up: latch onto one word they just said, ask one missing detail, then STOP.
 - If you have enough for this topic (or they decline), speak one close sentence and call complete_anchor_question immediately.
+- If you feel stuck, lost, or have nothing new: do not go silent and do not summarize. Ask one plain who/where/when question, or complete this topic now.
+- Later stages (enriched / legacy / memory) follow the same rule: finish speaking, then immediately ask or complete. Never sit waiting for them to prompt you.
 
 RECAP RULES (CRITICAL):
 - Do not summarize their life, earlier topics, or "what we have covered" unless they asked how far they are.

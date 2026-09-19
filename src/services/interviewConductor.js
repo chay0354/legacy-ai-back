@@ -97,7 +97,7 @@ Do NOT advance. answerSummary must be empty string.`;
 "${anchorQuestion}"
 ${digLine}
 
-${exclusionBlock ? `${exclusionBlock}\n\n` : ''}Conversation so far:
+${priorBlock}${exclusionBlock ? `${exclusionBlock}\n\n` : ''}Conversation so far:
 ${history || '(none)'}
 
 ${subjectName} just said:
@@ -173,7 +173,45 @@ function guardAdvance({ advance, isOpening, turns, userTranscript, stage }) {
   return Boolean(advance);
 }
 
-export async function conductorTurn(params) {
+/** A turn that neither asks nor closes leaves the person waiting — that is the "stuck" case. */
+function endsWithQuestion(text) {
+  return /[?؟]\s*["”']?\s*$/.test(String(text || '').trim());
+}
+
+function normalizeAsk(s) {
+  return String(s || '')
+    .toLowerCase()
+    .replace(/[^\p{L}\p{N}\s]/gu, '')
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
+function similarQuestion(a, b) {
+  const na = normalizeAsk(a);
+  const nb = normalizeAsk(b);
+  if (!na || !nb || na.length < 18 || nb.length < 18) return false;
+  if (na === nb) return true;
+  if (na.includes(nb) || nb.includes(na)) return true;
+  const ta = na.split(' ').filter((w) => w.length > 3);
+  const tb = new Set(nb.split(' ').filter((w) => w.length > 3));
+  if (ta.length < 3 || tb.size < 3) return false;
+  const hit = ta.filter((w) => tb.has(w)).length;
+  return hit / Math.min(ta.length, tb.size) >= 0.72;
+}
+
+/** Same or near-same question asked twice on one topic. */
+function repeatsEarlierQuestion(speak, turns) {
+  return (turns || []).some((t) => t.role === 'assistant' && similarQuestion(speak, t.text));
+}
+
+/** Recap-only turn — they sit waiting because nothing was asked. */
+function looksLikeRecapOnly(text) {
+  const t = String(text || '').trim();
+  if (!t || endsWithQuestion(t)) return false;
+  return /\b(so far (you('ve| have)|we('ve| have))|to (summarize|recap)|in summary|what we('ve| have) (covered|talked|discussed)|you (already )?(told|shared|mentioned)|we (already )?(talked|covered|discussed|heard)|let me (just )?(reflect|summarize|recap))\b/i.test(t);
+}
+
+async function askConductor(params, correction = '') {
   const raw = await callClaude({
     system: buildSystem(
       params.stage || 'foundation',
@@ -182,27 +220,47 @@ export async function conductorTurn(params) {
       params.gender || null,
       params.pronouns || null,
     ),
-    userMessage: buildUserMessage(params),
+    userMessage: buildUserMessage(params) + (correction ? `\n\nCORRECTION (your previous draft was rejected): ${correction}` : ''),
     maxTokens: 1024,
   });
   const text = typeof raw === 'string' ? raw : raw.text;
-
-  let parsed;
   try {
-    parsed = parseJsonFromClaude(text);
+    return parseJsonFromClaude(text);
   } catch {
     throw new Error('Interviewer returned invalid response');
   }
+}
 
-  const speak = String(parsed.speak || '').trim() || 'Take your time — I am listening.';
+export async function conductorTurn(params) {
+  let parsed = await askConductor(params);
+
+  const pausing = isPauseInterviewIntent(params.userTranscript);
+  const evaluate = (p) => {
+    const speak = String(p.speak || '').trim();
+    const advance = guardAdvance({
+      advance: Boolean(p.advance),
+      isOpening: Boolean(params.isOpening),
+      turns: params.turns,
+      userTranscript: params.userTranscript,
+      stage: params.stage || 'foundation',
+    });
+    return { speak, advance };
+  };
+
+  let { speak, advance } = evaluate(parsed);
+  // One corrective retry so the interviewer never stalls, recaps, or repeats itself.
+  if (!pausing && !advance && (looksLikeRecapOnly(speak) || (speak && !endsWithQuestion(speak)))) {
+    parsed = await askConductor(params, 'Do not recap. End this turn with ONE new specific question tied to their last words — or set advance:true with a one-sentence close. Never wait for them to say continue.');
+    ({ speak, advance } = evaluate(parsed));
+  } else if (!pausing && !advance && repeatsEarlierQuestion(speak, params.turns)) {
+    parsed = await askConductor(params, 'You already asked that. Ask a different specific follow-up about something they just said — or set advance:true with a one-sentence close.');
+    ({ speak, advance } = evaluate(parsed));
+  }
+
+  if (!speak) speak = 'Take your time — I am listening. What comes to mind first?';
+  if (!pausing && !advance && !endsWithQuestion(speak)) {
+    speak = 'What else comes to mind about that?';
+  }
   const answerSummary = String(parsed.answerSummary || '').trim();
-  const advance = guardAdvance({
-    advance: Boolean(parsed.advance),
-    isOpening: Boolean(params.isOpening),
-    turns: params.turns,
-    userTranscript: params.userTranscript,
-    stage: params.stage || 'foundation',
-  });
-
   return { speak, advance, answerSummary };
 }
