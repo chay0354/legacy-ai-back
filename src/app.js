@@ -93,7 +93,12 @@ export function createApp() {
   app.use('/api/auth', authRouter);
   app.use('/api/admin', adminRouter);
   app.get('/api/billing/plans', (_req, res) => {
-    res.json({ plans: publicPlans(), configured: stripeConfigured() });
+    res.json({
+      plans: publicPlans(),
+      entryPlan: 'setup',
+      continuationPlans: ['monthly', 'storage'],
+      configured: stripeConfigured(),
+    });
   });
   app.use('/api/billing', requireAuth, billingRouter);
 

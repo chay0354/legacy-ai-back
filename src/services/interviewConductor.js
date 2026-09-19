@@ -6,6 +6,7 @@ const STAGE_GOALS = {
   foundation: 'Breadth — identity, family, chapters, relationships, values, advice, personality. One gentle door at a time.',
   enriched: 'Depth — meaningful stories, relationships, and wisdom. Follow threads before moving on.',
   legacy: 'Meaning — values, gratitude, legacy intent. Slow, reflective, silence is welcome.',
+  memory: 'One more story — follow them. Do not run a questionnaire.',
 };
 
 function buildSystem(stage, subjectName, language = 'en', gender = null, pronouns = null) {
@@ -28,7 +29,9 @@ You manage ONE anchor question at a time. You:
 - Prefer concrete digs tied to their words: a name, place, time, what they saw, what someone said, one short example
 - Keep the topic, but let them answer in their own shape — if they wander into a real memory, stay with it
 - Do not broaden into "tell me about your whole life" or greeting-card openers, and do not treat the prompt like a form to complete
-- Use brief transitions only when moving to the next topic
+- Use brief transitions only when moving to the next topic — then immediately ask that topic. Never wait for them to say continue.
+- Do not summarize earlier topics or their life unless they asked how far they are.
+- Never re-ask facts they already answered (spouse, children, parents, hometown, siblings, work).
 - Personal background: ONLY use facts they explicitly said. Never invent or assume hometown, age, spouse/kids/parents, jobs, religion, dates, places, or feelings. Pronouns: follow the identity block strictly; if UNKNOWN never use he/him or she/her. Prefer "you" / their name. If vague, ask for one concrete detail — do not guess or fill gaps to sound warmer.
 - Exclusions: If they say don't talk about / prefer not to discuss a subject, honor it — never ask about it again. If that subject IS the current anchor, set advance:true with a short answerSummary noting they asked to leave it alone.
 - Stop/no intents: If they say skip, that's enough, stop asking, I don't want to answer, or decline a follow-up with no/no thanks — set advance:true immediately. Do not dig further. If they ask to pause/stop the interview, acknowledge and set advance:false with speak asking them to resume when ready (do not push a new question).
@@ -100,7 +103,9 @@ ${history || '(none)'}
 ${subjectName} just said:
 "${userTranscript}"
 
-Respond as the interviewer. If you follow up, ask ONE specific question tied to something they said — never a vague or cliché line ("tell me more" / "how did that feel?" / "thank you for sharing").
+Respond as the interviewer. Every speak turn must end with ONE question, or set advance:true with a one-sentence close. Never recap only. Never wait for "continue".
+If you follow up, ask ONE specific question tied to something they just said — never a vague or cliché line ("tell me more" / "how did that feel?" / "thank you for sharing").
+Do not re-ask settled facts from earlier topics.
 Update answerSummary with everything they've shared for this anchor question.
 Remember: advance:false unless they have clearly finished this topic with enough detail (or asked to leave this topic alone).`;
 }

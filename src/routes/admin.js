@@ -3,7 +3,7 @@ import { getAdminClient } from '../middleware/auth.js';
 import {
   adminConfigured, credentialsMatch, requireAdmin, signAdminToken,
 } from '../middleware/adminAuth.js';
-import { getPlan } from '../services/plans.js';
+import { getPlan, planCountsAsSetup } from '../services/plans.js';
 import { grantMissingPlans } from '../services/grantMissingPlans.js';
 import { publicBilling, stripeClient, stripeConfigured } from '../services/stripeBilling.js';
 import { getBillingByUserId, upsertBilling } from '../db/billingRepo.js';
@@ -40,6 +40,10 @@ async function applyBilling(userId, patch) {
     source: patch.source !== undefined ? patch.source : existing.source,
     notes: patch.notes !== undefined ? patch.notes : existing.notes,
     credits: patch.credits !== undefined ? patch.credits : existing.credits,
+    minutesRemaining: patch.minutesRemaining !== undefined
+      ? patch.minutesRemaining
+      : (existing.minutesRemaining ?? getPlan(patch.plan)?.minutes ?? 0),
+    setupPurchased: Boolean(existing.setupPurchased) || planCountsAsSetup(patch.plan),
   });
 }
 
@@ -250,7 +254,7 @@ router.post('/grant-missing-plans', requireAdmin, async (_req, res) => {
 
 router.post('/users/:id/plan', requireAdmin, async (req, res) => {
   try {
-    const allowed = new Set(['setup', 'monthly', 'preserve', 'archive', 'family', 'none']);
+    const allowed = new Set(['setup', 'monthly', 'storage', 'preserve', 'archive', 'family', 'none']);
     const plan = allowed.has(req.body?.plan) ? req.body.plan : 'monthly';
     const lifetime = Boolean(req.body?.lifetime);
     const status = plan === 'none' ? 'canceled' : 'active';

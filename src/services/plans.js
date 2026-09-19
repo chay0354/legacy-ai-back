@@ -2,8 +2,8 @@
 export const PLANS = {
   setup: {
     id: 'setup',
-    name: 'Set up',
-    cadence: 'one time · includes first 3 months',
+    name: 'Package',
+    cadence: 'one time · everyone starts here',
     amount: 69900,
     currency: 'usd',
     interval: null,
@@ -14,11 +14,12 @@ export const PLANS = {
     canInterview: true,
     canViewArchive: true,
     public: true,
-    primary: false,
+    primary: true,
+    step: 1,
     lines: [
-      'Everything in Monthly, prepaid for three months',
+      'The starting package for every new archive',
       'Interview, archive, live avatar, and family access',
-      '180 minutes included',
+      '180 minutes included for the first three months',
     ],
   },
   monthly: {
@@ -34,13 +35,36 @@ export const PLANS = {
     canInterview: true,
     canViewArchive: true,
     public: true,
-    primary: true,
+    primary: false,
+    step: 2,
     lines: [
-      'Guided interview and a full archive you can read',
-      'Live avatar and family invitations',
-      '60 minutes each month',
+      'Keep interviewing and talking with 60 minutes each month',
+      'Full archive, live avatar, and family invitations',
+      'Available after the $699 package',
     ],
   },
+  storage: {
+    id: 'storage',
+    name: 'Storage',
+    cadence: 'per month · keep your data',
+    amount: 699,
+    currency: 'usd',
+    interval: 'month',
+    checkoutMode: 'subscription',
+    maxOwnedArchives: 20,
+    minutes: 0,
+    canInterview: false,
+    canViewArchive: true,
+    public: true,
+    primary: false,
+    step: 2,
+    lines: [
+      'Keep the account and stored memories active',
+      'Read the archive — no new interview minutes',
+      'Available after the $699 package',
+    ],
+  },
+  /** Older one-time interview-only buyers — not sold on the site. */
   preserve: {
     id: 'preserve',
     name: 'Preserve',
@@ -53,12 +77,12 @@ export const PLANS = {
     minutes: 0,
     canInterview: true,
     canViewArchive: false,
-    public: true,
+    public: false,
     primary: false,
     lines: [
       'Record the guided interview',
       'We keep what you share',
-      'Pay Monthly or Set up when you want to see the archive',
+      'Pay Monthly or Storage when you want to see the archive',
     ],
   },
   addon: {
@@ -77,7 +101,7 @@ export const PLANS = {
     public: false,
     primary: false,
     lines: [
-      'Add 30 minutes to an active Monthly or Set up plan',
+      'Add 30 minutes to an active Package or Monthly plan',
     ],
   },
   /** Complimentary / older Stripe subscribers — full access, not sold on the site. */
@@ -119,11 +143,15 @@ export const PUBLIC_PLAN_IDS = PLAN_IDS.filter((id) => PLANS[id].public);
 const PRICE_ENV = {
   setup: 'STRIPE_PRICE_SETUP',
   monthly: 'STRIPE_PRICE_MONTHLY',
+  storage: 'STRIPE_PRICE_STORAGE',
   preserve: 'STRIPE_PRICE_PRESERVE',
   addon: 'STRIPE_PRICE_ADDON',
   archive: 'STRIPE_PRICE_ARCHIVE',
   family: 'STRIPE_PRICE_FAMILY',
 };
+
+/** Plans that mean the $699 starting package (or a full later plan) is already done. */
+const SETUP_COMPLETE_PLANS = new Set(['setup', 'monthly', 'storage', 'archive', 'family']);
 
 export function getPlan(id) {
   return PLANS[id] || null;
@@ -169,9 +197,13 @@ export function planCanViewArchive(id) {
   return Boolean(getPlan(id)?.canViewArchive);
 }
 
-/** Monthly and Set up spend the included minutes. Complimentary Archive/Family do not. */
+/** Monthly and the starting package spend included minutes. Storage and complimentary plans do not. */
 export function planUsesMinutes(id) {
   return id === 'monthly' || id === 'setup';
+}
+
+export function planCountsAsSetup(id) {
+  return SETUP_COMPLETE_PLANS.has(id);
 }
 
 export function addonOffer() {
@@ -209,6 +241,7 @@ export function publicPlans() {
       lines: p.lines,
       primary: Boolean(p.primary),
       kind: p.kind || 'plan',
+      step: p.step || null,
       canInterview: Boolean(p.canInterview),
       canViewArchive: Boolean(p.canViewArchive),
     };

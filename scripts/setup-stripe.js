@@ -49,6 +49,7 @@ const ids = PUBLIC_PLAN_IDS.concat(PLAN_IDS.filter((id) => !PUBLIC_PLAN_IDS.incl
 const envName = {
   setup: 'STRIPE_PRICE_SETUP',
   monthly: 'STRIPE_PRICE_MONTHLY',
+  storage: 'STRIPE_PRICE_STORAGE',
   preserve: 'STRIPE_PRICE_PRESERVE',
   addon: 'STRIPE_PRICE_ADDON',
   archive: 'STRIPE_PRICE_ARCHIVE',

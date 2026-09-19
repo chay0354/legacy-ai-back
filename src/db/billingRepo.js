@@ -21,6 +21,7 @@ function mapRow(row, extras = {}) {
     minutesRemaining: Number.isFinite(Number(extras.minutesRemaining))
       ? Number(extras.minutesRemaining)
       : Number(row.minutes_remaining) || 0,
+    setupPurchased: Boolean(extras.setupPurchased),
   };
 }
 
@@ -50,6 +51,7 @@ function fromMeta(userId, billing) {
     notes: billing.notes || null,
     credits: Array.isArray(billing.credits) ? billing.credits : [],
     minutesRemaining: Number(billing.minutesRemaining) || 0,
+    setupPurchased: Boolean(billing.setupPurchased),
   };
 }
 
@@ -86,6 +88,7 @@ async function writeAppMeta(req, mapped) {
         notes: mapped.notes || null,
         credits: mapped.credits || [],
         minutesRemaining: mapped.minutesRemaining || 0,
+        setupPurchased: Boolean(mapped.setupPurchased),
       },
     },
   });
@@ -162,6 +165,9 @@ function extrasFrom(patch, existing = {}) {
     minutesRemaining: patch.minutesRemaining !== undefined
       ? Number(patch.minutesRemaining) || 0
       : (existing.minutesRemaining || 0),
+    setupPurchased: patch.setupPurchased !== undefined
+      ? Boolean(patch.setupPurchased)
+      : Boolean(existing.setupPurchased),
   };
 }
 

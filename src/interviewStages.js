@@ -1,7 +1,6 @@
 import { FOUNDATION_QUESTIONS, COVERAGE_CATEGORIES as FOUNDATION_CATEGORIES } from './foundationQuestions.js';
 import { ENRICHED_QUESTIONS, ENRICHED_COVERAGE_CATEGORIES } from './enrichedQuestions.js';
 import { LEGACY_QUESTIONS, LEGACY_COVERAGE_CATEGORIES } from './legacyQuestions.js';
-import { withGapFillQuestions } from './requiredFacts.js';
 
 export const STAGE_ORDER = ['foundation', 'enriched', 'legacy'];
 
@@ -33,6 +32,19 @@ const STAGE_CONFIG = {
     goal: 'Meaning — worldview, personality, and conscious legacy',
     questions: LEGACY_QUESTIONS,
     coverageCategories: LEGACY_COVERAGE_CATEGORIES,
+  },
+  /** Open after the three structured stages — not part of STAGE_ORDER. */
+  memory: {
+    label: 'Another memory',
+    shortLabel: 'Memory',
+    goal: 'One more story, in their own words',
+    questions: [{
+      module: 'More',
+      category: 'story',
+      q: 'Tell me another story you want kept — a person, a place, a day, or whatever comes to mind.',
+      digFor: 'the scene as they hold it — who was there, where, what happened, why it stayed with them',
+    }],
+    coverageCategories: [],
   },
 };
 
@@ -97,13 +109,13 @@ export function areAllQuestionsAnswered(savedAnswers, questions) {
   return true;
 }
 
-export function questionsForSession(stage, savedAnswers = [], relationships = []) {
-  return withGapFillQuestions(getQuestionsForStage(stage), savedAnswers, relationships);
+export function questionsForSession(stage) {
+  return getQuestionsForStage(stage);
 }
 
-export function buildSessionPayload({ session, creator, stage, savedAnswers, relationships = [] }) {
+export function buildSessionPayload({ session, creator, stage, savedAnswers }) {
   const config = getStageConfig(stage);
-  const questions = questionsForSession(stage, savedAnswers, relationships);
+  const questions = questionsForSession(stage);
   return {
     session,
     creator,
@@ -112,6 +124,7 @@ export function buildSessionPayload({ session, creator, stage, savedAnswers, rel
     stageGoal: config.goal,
     questions: questions.map((q) => ({ q: q.q, digFor: q.digFor || '' })),
     questionMeta: questions,
+    coreQuestionCount: questions.length,
     savedAnswers: savedAnswers || [],
     resumeIndex: computeResumeIndex(savedAnswers, questions),
     stages: STAGE_ORDER.map((s) => ({

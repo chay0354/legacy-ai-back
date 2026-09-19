@@ -23,6 +23,7 @@ import {
   saveCreatorIdentity,
 } from '../services/genderProfile.js';
 import { assertVoiceSampleLongEnough } from '../services/audioDuration.js';
+import { unwrapPortraitIfPadded, PORTRAIT_LAYOUT_FULLBLEED } from '../services/portraitFix.js';
 import { assertArchivePaid, assertCanViewArchive, assertOwnerHasMinutes, assertUserPaid } from '../services/stripeBilling.js';
 import { toPaymentError } from './billing.js';
 
@@ -232,12 +233,22 @@ async function provisionAnam(req, creator) {
     let anamAvatarId = haveAvatar ? meta.anam_avatar_id : null;
     let anamVoiceId = haveVoice ? meta.anam_voice_id : null;
 
-    // Face — upload the stored portrait bytes so Anam does not fetch a signed URL.
     if (!anamAvatarId) {
+      await upsertAssets(req, creator.id, {
+        metadata: { ...meta, anam_language: language, anam_status: 'processing', anam_phase: 'photo', anam_error: null },
+      });
+      // Face — upload the stored portrait bytes so Anam does not fetch a signed URL.
       const { data: portraitFile, error: portraitErr } = await req.supabase.storage.from(BUCKET).download(portraitKey);
       if (portraitErr || !portraitFile) throw new Error(`Could not read the portrait photo: ${portraitErr?.message || 'not found'}`);
-      const portraitBuffer = Buffer.from(await portraitFile.arrayBuffer());
+      let portraitBuffer = Buffer.from(await portraitFile.arrayBuffer());
       if (!portraitBuffer.length) throw new Error('Could not read the portrait photo.');
+      try {
+        const force = meta.portrait_layout !== PORTRAIT_LAYOUT_FULLBLEED;
+        const unwrapped = await unwrapPortraitIfPadded(portraitBuffer, { force });
+        if (unwrapped.changed) portraitBuffer = unwrapped.buffer;
+      } catch (e) {
+        console.warn('[avatar/provision] portrait unwrap skipped:', e.message);
+      }
       const ext = (portraitKey.split('.').pop() || 'jpg').toLowerCase();
       const portraitType = ext === 'png' ? 'image/png' : ext === 'webp' ? 'image/webp' : 'image/jpeg';
       const portraitUrl = await signed(req, portraitKey);
@@ -262,8 +273,11 @@ async function provisionAnam(req, creator) {
       });
     }
 
-    // Voice — clone from the recorded sample stored in Supabase (language from Studio selector).
     if (!anamVoiceId) {
+      await upsertAssets(req, creator.id, {
+        metadata: { ...meta, anam_language: language, anam_status: 'processing', anam_phase: 'voice', anam_error: null },
+      });
+      // Voice — clone from the recorded sample stored in Supabase (language from Studio selector).
       if (meta.anam_voice_id && (
         meta.anam_voice_language !== language
         || meta.anam_voice_enhance !== voiceEnhance
@@ -303,6 +317,7 @@ async function provisionAnam(req, creator) {
         anam_voice_language: language,
         anam_voice_enhance: voiceEnhance,
         anam_provisioned_at: new Date().toISOString(),
+        anam_phase: 'live_face',
       },
     });
   } catch (e) {
@@ -390,11 +405,17 @@ router.get('/portrait', async (req, res) => {
       return res.status(404).json({ error: 'Could not load portrait' });
     }
 
-    const ext = (path.split('.').pop() || 'jpg').toLowerCase();
-    const type = ext === 'png' ? 'image/png' : ext === 'webp' ? 'image/webp' : ext === 'gif' ? 'image/gif' : 'image/jpeg';
-    res.setHeader('Content-Type', type);
-    res.setHeader('Cache-Control', 'private, max-age=300');
-    res.send(Buffer.from(await file.arrayBuffer()));
+    let bytes = Buffer.from(await file.arrayBuffer());
+    try {
+      const force = assets?.metadata?.portrait_layout !== PORTRAIT_LAYOUT_FULLBLEED;
+      const unwrapped = await unwrapPortraitIfPadded(bytes, { force });
+      if (unwrapped.changed) bytes = unwrapped.buffer;
+    } catch (e) {
+      console.warn('[avatar/portrait] unwrap skipped:', e.message);
+    }
+    res.setHeader('Content-Type', 'image/jpeg');
+    res.setHeader('Cache-Control', 'private, max-age=60');
+    res.send(bytes);
   } catch (e) {
     const status = e.status || 500;
     res.status(status).json({ error: e.message });
@@ -1325,6 +1346,7 @@ router.put('/assets', async (req, res) => {
         }
         patch.metadata = {
           ...(existing?.metadata || {}),
+          portrait_layout: PORTRAIT_LAYOUT_FULLBLEED,
           anam_status: 'none',
           anam_avatar_id: null,
           anam_avatar_portrait_path: null,

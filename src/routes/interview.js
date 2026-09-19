@@ -38,7 +38,15 @@ import {
   nextStage,
   areAllQuestionsAnswered,
   stageCompleteLevel,
+  STAGE_COMPLETE_LEVEL,
 } from '../interviewStages.js';
+
+async function structuredInterviewsDone(req, creator, usePg) {
+  if ((creator.avatar_level ?? 0) >= STAGE_COMPLETE_LEVEL.legacy) return true;
+  return usePg
+    ? hasProcessedSessionPg(creator.id, 'legacy')
+    : hasFinishedSessionSupabase(req.supabase, creator.id, 'legacy');
+}
 
 const router = Router();
 const MEDIA_BUCKET = 'legacy-media';
@@ -235,6 +243,44 @@ async function resolveStageSessionPg(creator, requestedStage) {
   return { allComplete: true };
 }
 
+async function resolveMemorySessionPg(creator) {
+  const active = await getActiveSessionPg(creator.id, 'memory');
+  if (active) return { stage: 'memory', session: active };
+  const count = await countSessionsPg(creator.id);
+  const session = await createSessionPg(creator.id, count + 1, 'Another memory', 'memory');
+  return { stage: 'memory', session };
+}
+
+async function resolveMemorySessionSupabase(supabase, creator) {
+  const { data: active } = await supabase
+    .from('legacy_interview_sessions')
+    .select('*')
+    .eq('creator_id', creator.id)
+    .eq('stage', 'memory')
+    .eq('status', 'in_progress')
+    .order('created_at', { ascending: false })
+    .limit(1)
+    .maybeSingle();
+  if (active) return { stage: 'memory', session: active };
+  const { count } = await supabase
+    .from('legacy_interview_sessions')
+    .select('*', { count: 'exact', head: true })
+    .eq('creator_id', creator.id);
+  const { data: created, error } = await supabase
+    .from('legacy_interview_sessions')
+    .insert({
+      creator_id: creator.id,
+      session_number: (count ?? 0) + 1,
+      label: 'Another memory',
+      stage: 'memory',
+      status: 'in_progress',
+    })
+    .select()
+    .single();
+  if (error) throw error;
+  return { stage: 'memory', session: created };
+}
+
 async function resolveStageSessionSupabase(supabase, creator, requestedStage) {
   let stage = resolveInterviewStage(creator, requestedStage);
 
@@ -305,6 +351,7 @@ async function loadRelationships(req, creatorId, usePg) {
 
 /** If every topic is saved but status never left in_progress, mark finished so refresh won't reopen it. */
 async function selfHealFullyAnsweredSession(req, { usePg, creator, stage, session, savedAnswers, relationships = [] }) {
+  if (stage === 'memory') return null;
   const questions = questionsForSession(stage, savedAnswers, relationships);
   if (session.status !== 'in_progress') return null;
   if (!areAllQuestionsAnswered(savedAnswers, questions)) return null;
@@ -412,12 +459,16 @@ router.get('/session', async (req, res) => {
     await assertUserPaid(req);
     const usePg = !!getPool();
     const requestedStage = req.query.stage || null;
+    const wantMemory = String(req.query.mode || '') === 'memory';
 
     if (usePg) {
       let creator = await getOrCreateCreatorPg(req.user.id, displayName(req.user));
       await ensureOwnerMembership(req, creator.id);
+      const memoryMode = wantMemory && await structuredInterviewsDone(req, creator, true);
 
-      let resolved = await resolveStageSessionPg(creator, requestedStage);
+      let resolved = memoryMode
+        ? await resolveMemorySessionPg(creator)
+        : await resolveStageSessionPg(creator, requestedStage);
       if (resolved.allComplete) {
         return res.json({
           allStagesComplete: true,
@@ -455,7 +506,9 @@ router.get('/session', async (req, res) => {
         savedAnswers = await getAnswersPg(session.id);
       }
 
-      const priorStories = await loadPriorStories(req, creator.id, stage, true, session?.id);
+      const priorStories = await loadPriorStories(
+        req, creator.id, stage === 'memory' ? 'legacy' : stage, true, session?.id,
+      );
       return res.json({
         ...buildSessionPayload({ session, creator, stage, savedAnswers, relationships }),
         priorStories,
@@ -466,8 +519,11 @@ router.get('/session', async (req, res) => {
 
     let creator = await getOrCreateCreatorSupabase(req.supabase, req.user);
     await ensureOwnerMembership(req, creator.id);
+    const memoryMode = wantMemory && await structuredInterviewsDone(req, creator, false);
 
-    let resolved = await resolveStageSessionSupabase(req.supabase, creator, requestedStage);
+    let resolved = memoryMode
+      ? await resolveMemorySessionSupabase(req.supabase, creator)
+      : await resolveStageSessionSupabase(req.supabase, creator, requestedStage);
     if (resolved.allComplete) {
       return res.json({
         allStagesComplete: true,
@@ -516,7 +572,9 @@ router.get('/session', async (req, res) => {
     }
 
     const topicExclusions = await loadTopicExclusionsSupabase(req.supabase, creator.id);
-    const priorStories = await loadPriorStories(req, creator.id, stage, false, session?.id);
+    const priorStories = await loadPriorStories(
+      req, creator.id, stage === 'memory' ? 'legacy' : stage, false, session?.id,
+    );
     res.json({
       ...buildSessionPayload({ session, creator, stage, savedAnswers, relationships }),
       priorStories,

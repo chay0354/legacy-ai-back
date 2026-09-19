@@ -38,12 +38,54 @@ const STAGE_GOALS = {
   foundation: 'Breadth — identity, family, chapters, relationships, values, advice, personality. One door at a time, with real curiosity.',
   enriched: 'Depth — meaningful stories, relationships, and wisdom. Follow threads before moving on.',
   legacy: 'Meaning — values, gratitude, legacy intent. Slow and reflective.',
+  memory: 'One more story — follow them. Do not run a questionnaire.',
 };
+
+function dedupeTopics(topics) {
+  const seen = new Set();
+  const out = [];
+  for (const t of topics || []) {
+    if (!t || !(t.summary || t.answer)) continue;
+    const key = String(t.question || t.module || t.summary || t.answer || '')
+      .slice(0, 96)
+      .toLowerCase()
+      .trim();
+    if (!key || seen.has(key)) continue;
+    seen.add(key);
+    out.push(t);
+  }
+  return out;
+}
+
+function formatAnsweredFacts(topics) {
+  const text = (topics || [])
+    .map((t) => `${t.question || t.module || ''} ${t.summary || t.answer || ''}`)
+    .join('\n');
+  if (!text.trim()) return '';
+  const facts = [];
+  if (/\b(husband|wife|spouse|partner|fiancé|fiancee?|בעלי|אשתי|בן הזוג|בת הזוג)\b/i.test(text)) {
+    facts.push('spouse / partner — already discussed; do not ask whether they have one');
+  }
+  if (/\b(son|daughter|children|kids|child|הבן|הבת|הילדים)\b/i.test(text)) {
+    facts.push('children — already discussed; do not ask whether they have children');
+  }
+  if (/\b(mother|mom|mum|father|dad|parents|אמא|אבא|ההורים)\b/i.test(text)) {
+    facts.push('parents — already discussed; do not ask their names again');
+  }
+  if (/\b(grew up|raised|hometown|born in|גדלתי|נולדתי)\b/i.test(text)) {
+    facts.push('hometown / where they grew up — already discussed');
+  }
+  if (/\b(brother|sister|siblings|only child|אח|אחות|אחים)\b/i.test(text)) {
+    facts.push('siblings — already discussed; do not ask if they had brothers or sisters');
+  }
+  if (!facts.length) return '';
+  return `ALREADY ANSWERED — DO NOT ASK AGAIN:
+${facts.map((f) => `- ${f}`).join('\n')}`;
+}
 
 function formatPriorTopics(priorTopics, language = 'en') {
   if (!Array.isArray(priorTopics) || priorTopics.length === 0) return '';
-  const lines = priorTopics
-    .filter((t) => t && (t.summary || t.answer))
+  const lines = dedupeTopics(priorTopics)
     .map((t, i) => {
       const label = t.module || t.question || `Topic ${i + 1}`;
       const summary = sanitizeForSessionLanguage(
@@ -80,11 +122,12 @@ export function buildRealtimeInstructions({
 }) {
   const sessionLanguage = normalizeSessionLanguage(language);
   const languageName = languageDisplayName(sessionLanguage);
-  const allPrior = [
+  const allPrior = dedupeTopics([
     ...(Array.isArray(priorStories) ? priorStories : []),
     ...(Array.isArray(priorTopics) ? priorTopics : []),
-  ];
+  ]);
   const storyBlock = formatPriorTopics(allPrior, sessionLanguage);
+  const answeredFacts = formatAnsweredFacts(allPrior);
   const identityKnown = Boolean(pronouns);
   const freeTalk = guidanceMode === 'free';
   const lightTalk = guidanceMode === 'light';
@@ -113,13 +156,11 @@ export function buildRealtimeInstructions({
 - Do NOT run 4–5 questions. Do not sound like a form.`
     : returning && isOpening
     ? `Opening a later sitting (REQUIRED — they have talked with you before):
-Speak 3–5 warm sentences, then STOP and wait:
-1. Welcome ${subjectName} back — do not treat this as a first meeting.
-2. Cite one or two concrete things they already shared (from CONFIRMED FROM THIS INTERVIEW). Use their words, not a generic "last time we talked."
-3. Say this sitting continues that work — they can wander, pause, or skip.
-4. Then open the topic below in spoken words.
+Speak TWO short sentences, then the first topic question, then STOP and wait:
+1. Welcome ${subjectName} back and name one concrete thing they already shared (from CONFIRMED).
+2. Then open the topic below in spoken words.
 
-Do NOT re-explain the whole product as if they are new.
+Do NOT recap their life. Do NOT re-explain the product. Do NOT wait for them to say continue.
 Do NOT call complete_anchor_question until they have actually shared something.`
     : isOpening
     ? `Opening this interview (REQUIRED — do this before the first topic question):
@@ -132,12 +173,12 @@ Speak a short process intro in your own warm words, covering ALL of these points
 
 Do NOT rush into the first question without that orientation.
 Do NOT call complete_anchor_question until they have actually shared something.`
-    : `Opening this next topic:
-- Do NOT re-welcome them as if the interview just started.
-- Transition like a real conversation: a soft progress cue in plain language, optional bridge from something they shared, then the new question in your own words.
-- Good: "We're a little further along — topic ${topicNum} of ${total}. You mentioned …; I'd love to hear about …"
-- Avoid robotic phrasing like "Next question." or "Proceeding to topic ${topicNum}."
-- Avoid cliché bridges like "Building on that beautiful thought…" or "Zooming out for a moment…"`;
+    : `Opening this next topic (REQUIRED — do this in your first spoken turn, then STOP):
+- Do NOT re-welcome them. Do NOT recap earlier topics. Do NOT wait for them to say "continue".
+- One soft progress cue, optional one-word bridge from THIS sitting, then ask the new topic in your own words.
+- Good: "We're on topic ${topicNum} of ${total}. I'd love to hear about …"
+- Then STOP and wait. Your turn is not finished until you have asked the new question.
+- Avoid robotic phrasing like "Next question." Avoid cliché bridges like "Building on that beautiful thought…"`;
 
   return `You are Legacy AI — a warm, patient voice interviewer sitting with ${subjectName}, helping preserve their life story for family.
 
@@ -153,7 +194,7 @@ SESSION LANGUAGE (CRITICAL — never drift):
 Voice & presence (critical — you must not sound mechanical):
 - Speak like a calm, curious person in the room — not an IVR, survey, therapist script, or chatbot reading a form.
 - Vary your wording every turn. Never recycle the same acknowledgment.
-- Reflect a specific detail they said before you ask more — show you were listening.
+- If they just answered THIS topic, you may echo one short detail — then ask or close. Do not recap earlier topics.
 - Soften transitions; leave a little air. Silence after a question is good — wait for them.
 - Prefer contractions and natural spoken ${languageName} ("I'd love to hear about that house…" / "What did your father do for work?" when in English).
 - Do NOT sound like you are ticking boxes. Do NOT say "question ${topicNum}" or "next item."
@@ -168,7 +209,7 @@ Anti-cliché (CRITICAL — no stock interview lines):
 - Ban fortune-cookie openers: "If you could give one piece of advice…" when they already answered; "Looking back on your journey…"; "What defines you as a person?"
 - Every question must sound like it belongs to THIS conversation — weave in a word, name, place, or detail they already used.
 - If you cannot personalize the follow-up from their words, ask one plain factual dig (who / where / when / what happened) instead of a therapy-style cliché.
-- Acknowledgments: echo their content in fresh words ("You grew up with three sisters in that city —") then ask. Do not praise generically.
+- Acknowledgments: one short echo of what they just said on THIS topic, then ask. Never a life summary. Do not praise generically.
 
 Stage: ${stage}. ${STAGE_GOALS[stage] || STAGE_GOALS.foundation}
 
@@ -183,8 +224,9 @@ ${formatIdentityPromptBlock({ name: subjectName, gender, pronouns })}
 ${identityKnown
     ? `Identity is already set (${pronouns}). NEVER ask their gender or pronouns. Do not confirm them out loud unless they bring it up.`
     : 'Only update gender/pronouns if THEY explicitly state them aloud in this interview. Do not guess from the name.'}
-Never re-ask a fact already listed under CONFIRMED FROM THIS INTERVIEW (spouse, children, parents, hometown, work).
+Never re-ask a fact already listed under CONFIRMED FROM THIS INTERVIEW or ALREADY ANSWERED (spouse, children, parents, hometown, siblings, work).
 
+${answeredFacts ? `${answeredFacts}\n` : ''}
 ${storyBlock ? `${storyBlock}\n` : ''}
 ${exclusionBlock ? `${exclusionBlock}\n` : ''}
 Exclusions (CRITICAL):
@@ -209,9 +251,21 @@ Specific, non-generic questions (CRITICAL):
 - If their first answer is abstract, give them a beat — then ask for one example or moment, not another abstract or emotional-cliché question.
 - One question per turn. Never stack two broad questions.
 
+NEXT MOVE (REQUIRED every spoken turn — never leave them hanging):
+- Every turn must end with either ONE question, or a one-sentence close plus complete_anchor_question.
+- Never end a turn with only a recap. Never wait for them to say "continue" or "go on".
+- After a new topic loads, your first spoken turn MUST ask that topic now.
+- Follow-up: latch onto one word they just said, ask one missing detail, then STOP.
+- If you have enough for this topic (or they decline), speak one close sentence and call complete_anchor_question immediately.
+
+RECAP RULES (CRITICAL):
+- Do not summarize their life, earlier topics, or "what we have covered" unless they asked how far they are.
+- Do not open a turn with a recap of previous answers.
+- The spoken close before complete_anchor_question is ONE sentence about THIS topic only.
+
 How to conduct this topic:
 - Keep most spoken turns to 1–3 sentences (live call), but let warmth and specificity matter more than brevity.
-- Listen fully. Acknowledge with a concrete echo of what they said, then ask ONE specific follow-up at a time.
+- Listen fully. Acknowledge with a concrete echo of what they just said on this topic, then ask ONE specific follow-up at a time.
 - Let them tell the story first. If names, places, times, or examples appear, stay with those. Do not quiz them through a checklist before they have had room to speak.
 ${freeTalk
     ? '- No question quota — they lead. Complete only when they are done or ask to stop.'
@@ -232,7 +286,7 @@ Progress questions (IMPORTANT):
 - Examples: "We're on topic ${topicNum} of ${total}." / "This is the last one for this stage." / "About ${remaining} after this."
 
 When to call complete_anchor_question:
-- First speak a short spoken close for this topic (one warm sentence that lands). Finish that sentence fully.
+- First speak a short spoken close for THIS topic only (one warm sentence). No recap of earlier topics.
 - THEN call complete_anchor_question — never cut yourself off mid-sentence by calling the tool first.
 ${freeTalk
     ? '- Complete when they say they are done, want to stop, or finish a thread after you offer to stay or leave it.'

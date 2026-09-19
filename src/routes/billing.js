@@ -1,14 +1,15 @@
 import { Router } from 'express';
 import express from 'express';
 import {
-  checkoutPlanId, getPlan, isAddonPlan, isPaidStatus, planCanViewArchive,
+  checkoutPlanId, getPlan, isAddonPlan, isPaidStatus, planUsesMinutes,
   PLAN_IDS, publicPlans,
 } from '../services/plans.js';
 import {
   applyCheckoutSession,
   applySubscriptionEvent,
   billingForUser,
-  publicBilling,
+  hasCompletedSetup,
+  listBillingHistory,
   rememberCustomer,
   resolvePriceId,
   stripeClient,
@@ -79,8 +80,11 @@ export function billingWebhookHandler() {
 }
 
 router.get('/plans', (_req, res) => {
+  const plans = publicPlans();
   res.json({
-    plans: publicPlans(),
+    plans,
+    entryPlan: 'setup',
+    continuationPlans: ['monthly', 'storage'],
     configured: stripeConfigured(),
   });
 });
@@ -97,17 +101,26 @@ router.post('/checkout', async (req, res) => {
   try {
     if (!stripeConfigured()) return res.status(503).json({ error: 'Billing is not configured yet.' });
     const planId = checkoutPlanId(req.body?.plan);
-    if (!planId) return res.status(400).json({ error: 'Choose Set up, Monthly, Preserve, or a 30 minute add-on.' });
+    if (!planId || !['setup', 'monthly', 'storage', 'addon'].includes(planId)) {
+      return res.status(400).json({ error: 'Choose the Package, Monthly, Storage, or a 30 minute add-on.' });
+    }
     const spec = getPlan(planId);
     const priceId = await resolvePriceId(planId);
     if (!priceId) return res.status(503).json({ error: `Missing Stripe price for ${planId}` });
 
     const stripe = stripeClient();
     const existing = await getBillingByUserId(req, req.user.id);
+    const hasSetup = hasCompletedSetup(existing);
+    if (planId === 'setup' && hasSetup) {
+      return res.status(400).json({ error: 'You already have the starting package. Choose Monthly or Storage to continue.' });
+    }
+    if ((planId === 'monthly' || planId === 'storage') && !hasSetup) {
+      return res.status(400).json({ error: 'Start with the $699 package. After that you can choose Monthly or Storage.' });
+    }
     if (isAddonPlan(planId)) {
-      if (!isPaidStatus(existing?.status, existing?.currentPeriodEnd) || !planCanViewArchive(existing?.plan)) {
+      if (!isPaidStatus(existing?.status, existing?.currentPeriodEnd) || !planUsesMinutes(existing?.plan)) {
         return res.status(400).json({
-          error: 'The 30 minute add-on is for an active Monthly or Set up plan. Choose a plan first.',
+          error: 'The 30 minute add-on is for an active Package or Monthly plan. Storage does not include interview minutes.',
         });
       }
     }
@@ -137,7 +150,7 @@ router.post('/checkout', async (req, res) => {
       success_url: isAddonPlan(planId)
         ? `${front}/billing/success?session_id={CHECKOUT_SESSION_ID}&addon=1`
         : `${front}/billing/success?session_id={CHECKOUT_SESSION_ID}`,
-      cancel_url: isAddonPlan(planId) ? `${front}/settings` : `${front}/pricing`,
+      cancel_url: isAddonPlan(planId) || hasSetup ? `${front}/billing` : `${front}/pricing`,
       allow_promotion_codes: true,
       metadata: { userId: req.user.id, plan: planId, priceId },
       // The site quotes USD, so Checkout must charge USD rather than a converted local amount.
@@ -147,6 +160,9 @@ router.post('/checkout', async (req, res) => {
       params.subscription_data = {
         metadata: { userId: req.user.id, plan: planId },
       };
+    }
+    if (mode === 'payment') {
+      params.invoice_creation = { enabled: true };
     }
 
     let session;
@@ -174,9 +190,18 @@ router.post('/portal', async (req, res) => {
     }
     const session = await stripeClient().billingPortal.sessions.create({
       customer: existing.stripeCustomerId,
-      return_url: `${frontendBase(req)}/settings`,
+      return_url: `${frontendBase(req)}/billing`,
     });
     res.json({ url: session.url });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+router.get('/invoices', async (req, res) => {
+  try {
+    if (!stripeConfigured()) return res.json({ invoices: [] });
+    res.json({ invoices: await listBillingHistory(req, req.user.id) });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }

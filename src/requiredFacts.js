@@ -45,6 +45,8 @@ export const REQUIRED_FACTS = [
     digFor: 'whether they have children; if yes, how many and each child’s name',
     covered(text, relationships) {
       if (relsOfType(relationships, CHILD_TYPES).length) return true;
+      if (/\b(i have|we've got|we have|i've got)\s+\d+\s+(kids|children|sons|daughters)\b/i.test(text)) return true;
+      if (/\b(my|our)\s+(son|daughter|kids|children)\b/i.test(text)) return true;
       if (/\b(no|never had|didn'?t have|don'?t have|do not have)\s+(any\s+)?(kids|children|child)\b/i.test(text)) return true;
       if (/\b(childless|no children|no kids)\b/i.test(text)) return true;
       if (/(אין לי ילדים|בלי ילדים|לא היו לי ילדים)/.test(text)) return true;
@@ -66,6 +68,7 @@ export const REQUIRED_FACTS = [
     digFor: 'whether there is a spouse or partner; their name if there is one',
     covered(text, relationships) {
       if (relsOfType(relationships, SPOUSE_TYPES).length) return true;
+      if (/\b(my|our)\s+(husband|wife|spouse|partner|fiancé|fiancee?)\b/i.test(text)) return true;
       if (/\b(never married|not married|unmarried|no (husband|wife|spouse|partner)|didn'?t marry)\b/i.test(text)) return true;
       if (/(לא נשוי|לא נשואה|מעולם לא התחתנ)/.test(text)) return true;
       if (/(בעלי|אשתי|בן הזוג שלי|בת הזוג שלי)\s+\S+/.test(text)) return true;
@@ -86,6 +89,7 @@ export const REQUIRED_FACTS = [
     digFor: 'mother’s and/or father’s names, or that they never knew them',
     covered(text, relationships) {
       if (relsOfType(relationships, PARENT_TYPES).length) return true;
+      if (/\b(my|our)\s+(mother|mom|mum|mama|father|dad|papa|parents)\b/i.test(text)) return true;
       if (/\b(never knew (my )?(parents|mother|father)|don'?t remember (my )?(parents|mother|father)'?s? names?)\b/i.test(text)) return true;
       if (/(לא הכרתי את ההורים|לא זוכר את השמות של ההורים)/.test(text)) return true;
       if (/(אמא שלי|אבא שלי)\s+\S+/.test(text)) return true;
@@ -105,6 +109,7 @@ export const REQUIRED_FACTS = [
     q: 'Where did you grow up — the place that felt like home?',
     digFor: 'a town, city, or region they name as home',
     covered(text) {
+      if (/\b(grew up|was raised|born)\b/i.test(text) && /\b(in|near|outside)\b/i.test(text)) return true;
       if (/(גדלתי ב|נולדתי ב|באתי מ)\s+\S+/.test(text)) return true;
       return named(
         new RegExp(
@@ -123,6 +128,7 @@ export const REQUIRED_FACTS = [
     digFor: 'whether they had siblings, and names if they share them',
     covered(text, relationships) {
       if (relsOfType(relationships, SIBLING_TYPES).length) return true;
+      if (/\b(my|our)\s+(brother|sister|siblings)\b/i.test(text)) return true;
       if (/\b(only child|no (brothers|sisters|siblings)|didn'?t have (any )?(brothers|sisters|siblings))\b/i.test(text)) return true;
       if (/(ילד יחיד|ילדה יחידה|אין לי אחים|אין לי אחיות)/.test(text)) return true;
       if (/(אח שלי|אחות שלי)\s+\S+/.test(text)) return true;

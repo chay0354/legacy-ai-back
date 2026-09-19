@@ -1,7 +1,7 @@
 import Stripe from 'stripe';
 import {
   addonOffer, getPlan, isAddonPlan, isPaidStatus, planCanInterview, planCanViewArchive,
-  planIdFromPriceId, planUsesMinutes, priceIdForPlan, setResolvedPrice,
+  planCountsAsSetup, planIdFromPriceId, planUsesMinutes, priceIdForPlan, setResolvedPrice,
 } from './plans.js';
 import {
   getBillingByCustomerId, getBillingByUserId, ownerUserIdForCreator, upsertBilling,
@@ -44,12 +44,24 @@ export async function resolvePriceId(planId) {
   }
 }
 
+export function hasCompletedSetup(row) {
+  if (row?.setupPurchased) return true;
+  const plan = row?.plan;
+  if (planCountsAsSetup(plan)) return true;
+  // Older one-time Preserve buyers already paid something — they may pick Monthly or Storage.
+  return plan === 'preserve' && isPaidStatus(row?.status, row?.currentPeriodEnd);
+}
+
 export function publicBilling(row) {
   const paid = isPaidStatus(row?.status, row?.currentPeriodEnd);
   const plan = paid ? (row.plan || 'none') : 'none';
   const usesMinutes = paid && planUsesMinutes(plan);
   const minutesRemaining = paid ? (Number(row?.minutesRemaining) || 0) : 0;
   const canViewArchive = paid && planCanViewArchive(plan);
+  const hasSetup = hasCompletedSetup(row);
+  const complimentary = plan === 'archive' || plan === 'family' || row?.source === 'comp';
+  const canChooseContinuation = hasSetup && !complimentary && (!paid || plan === 'setup' || plan === 'preserve');
+  const canBuyAddon = paid && usesMinutes;
   return {
     plan,
     status: row?.status || 'none',
@@ -65,8 +77,11 @@ export function publicBilling(row) {
     minutesExhausted: usesMinutes && minutesRemaining <= 0,
     canInterview: paid && planCanInterview(plan),
     canViewArchive,
-    canBuyAddon: canViewArchive,
-    addon: canViewArchive ? addonOffer() : null,
+    hasSetup,
+    needsSetup: !hasSetup,
+    canChooseContinuation,
+    canBuyAddon,
+    addon: canBuyAddon ? addonOffer() : null,
   };
 }
 
@@ -129,7 +144,7 @@ function paymentError(message, code = 'PAYMENT_REQUIRED') {
 }
 
 function minutesError() {
-  return paymentError('Your minutes are used. Add 30 minutes in Settings to continue.', 'MINUTES_REQUIRED');
+  return paymentError('Your minutes are used. Add 30 minutes from Billing to continue.', 'MINUTES_REQUIRED');
 }
 
 /** Owner starting the interview (Preserve is enough). */
@@ -151,7 +166,7 @@ export async function assertCanViewArchive(req, creatorId) {
   if (!ownerId) throw paymentError('Choose a plan to see the archive.');
   const billing = await billingForUser(req, ownerId);
   if (!billing.canViewArchive) {
-    throw paymentError('Pay Monthly or Set up to see the stories, people, and wisdom from this interview.');
+    throw paymentError('Pay Monthly or Storage to see the stories, people, and wisdom from this interview.');
   }
   return billing;
 }
@@ -168,10 +183,10 @@ export async function ownerCanViewArchive(req, creatorId) {
 export async function assertArchivePaid(req, creatorId) {
   if (!stripeConfigured()) return;
   const ownerId = await ownerUserIdForCreator(req, creatorId);
-  if (!ownerId) throw paymentError('This archive needs Monthly or Set up for live calls and family invitations.');
+  if (!ownerId) throw paymentError('This archive needs an open plan for live calls and family invitations.');
   const billing = await billingForUser(req, ownerId);
   if (!billing.canViewArchive) {
-    throw paymentError('This archive needs Monthly or Set up for live calls and family invitations.');
+    throw paymentError('This archive needs Monthly or Storage for live calls and family invitations.');
   }
 }
 
@@ -202,6 +217,7 @@ export async function consumeMinutes(req, userId, durationSeconds) {
     notes: existing.notes,
     credits: existing.credits,
     minutesRemaining: next,
+    setupPurchased: Boolean(existing.setupPurchased),
   });
 }
 
@@ -226,6 +242,7 @@ export async function rememberCustomer(req, userId, customerId) {
     currentPeriodEnd: existing?.currentPeriodEnd,
     cancelAtPeriodEnd: existing?.cancelAtPeriodEnd,
     minutesRemaining: existing?.minutesRemaining || 0,
+    setupPurchased: existing?.setupPurchased || false,
   });
 }
 
@@ -275,6 +292,7 @@ export async function persistSubscription(req, { userId, customerId, subscriptio
     cancelAtPeriodEnd: Boolean(subscription?.cancel_at_period_end),
     source: 'stripe',
     minutesRemaining: existingMinutes > 0 ? existingMinutes : (spec?.minutes || 0),
+    setupPurchased: Boolean(existing?.setupPurchased) || planCountsAsSetup(resolved),
   });
 }
 
@@ -305,6 +323,7 @@ export async function persistOneTimePurchase(req, {
       notes: existing?.notes || null,
       credits: existing?.credits || [],
       minutesRemaining: (Number(existing?.minutesRemaining) || 0) + (getPlan(plan)?.minutes || 30),
+      setupPurchased: Boolean(existing?.setupPurchased),
     });
   }
 
@@ -326,10 +345,11 @@ export async function persistOneTimePurchase(req, {
     cancelAtPeriodEnd: false,
     source: 'stripe',
     notes: plan === 'preserve'
-      ? 'Interview only — pay Monthly or Set up to see the archive.'
+      ? 'Interview only — pay Monthly or Storage to see the archive.'
       : existing?.notes || null,
     credits: existing?.credits || [],
     minutesRemaining: existingMinutes > 0 ? existingMinutes : (spec?.minutes || 0),
+    setupPurchased: Boolean(existing?.setupPurchased) || plan === 'setup' || planCountsAsSetup(plan),
   });
 }
 
@@ -468,6 +488,54 @@ export async function applySubscriptionEvent(req, subscription) {
     return null;
   }
   return persistSubscription(req, { userId, customerId, subscription });
+}
+
+export async function listBillingHistory(req, userId) {
+  if (!stripeConfigured()) return [];
+  const existing = await getBillingByUserId(req, userId);
+  if (!existing?.stripeCustomerId) return [];
+  const stripe = stripeClient();
+  const [invoices, sessions] = await Promise.all([
+    stripe.invoices.list({ customer: existing.stripeCustomerId, limit: 24 }),
+    stripe.checkout.sessions.list({ customer: existing.stripeCustomerId, limit: 24 }),
+  ]);
+  const items = invoices.data.map((inv) => ({
+    id: inv.id,
+    number: inv.number || null,
+    status: inv.status || 'open',
+    amountPaid: inv.amount_paid || 0,
+    amountDue: inv.amount_due || 0,
+    currency: inv.currency || 'usd',
+    created: inv.created ? new Date(inv.created * 1000).toISOString() : null,
+    hostedInvoiceUrl: inv.hosted_invoice_url || null,
+    invoicePdf: inv.invoice_pdf || null,
+    description: inv.description || inv.lines?.data?.[0]?.description || 'Invoice',
+    kind: 'invoice',
+  }));
+  const seen = new Set(items.map((i) => i.id));
+  for (const session of sessions.data) {
+    if (!checkoutLooksPaid(session) || seen.has(session.id)) continue;
+    items.push({
+      id: session.id,
+      number: null,
+      status: 'paid',
+      amountPaid: session.amount_total || 0,
+      amountDue: 0,
+      currency: session.currency || 'usd',
+      created: session.created ? new Date(session.created * 1000).toISOString() : null,
+      hostedInvoiceUrl: session.invoice
+        ? null
+        : (session.url || null),
+      invoicePdf: null,
+      description: session.metadata?.plan
+        ? `Checkout · ${getPlan(session.metadata.plan)?.name || session.metadata.plan}`
+        : 'Checkout',
+      kind: 'checkout',
+    });
+  }
+  return items
+    .filter((item) => item.status === 'paid' || item.status === 'open' || item.amountPaid > 0)
+    .sort((a, b) => new Date(b.created || 0) - new Date(a.created || 0));
 }
 
 export function adminReq() {
