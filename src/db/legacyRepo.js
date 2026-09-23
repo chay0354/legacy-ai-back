@@ -1,5 +1,6 @@
 import { getPool } from '../db/pool.js';
 import { filterNewMemories } from '../services/memoryDedupe.js';
+import { toImportanceWord, toScore } from '../services/extractionNormalize.js';
 
 export async function getOrCreateCreatorPg(userId, displayName) {
   const db = getPool();
@@ -120,7 +121,7 @@ export async function saveExtractionPg(creatorId, sessionId, extracted) {
         await client.query(
           `INSERT INTO legacy_memories (creator_id, session_id, title, summary, full_transcript, category, tags, people_involved, location, age, year, year_confidence, emotional_significance, lesson_learned, importance)
            VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15)`,
-          [creatorId, sessionId, m.title, m.summary, m.full_transcript, m.category, m.tags || [], m.people_involved || [], m.location, m.age, m.year, m.year_confidence, m.emotional_significance, m.lesson_learned, m.importance || 'medium']
+          [creatorId, sessionId, m.title, m.summary, m.full_transcript, m.category, m.tags || [], m.people_involved || [], m.location, m.age, m.year, m.year_confidence, m.emotional_significance, m.lesson_learned, toImportanceWord(m.importance)]
         );
       }
     }
@@ -130,7 +131,7 @@ export async function saveExtractionPg(creatorId, sessionId, extracted) {
         await client.query(
           `INSERT INTO legacy_relationships (creator_id, name, relationship_type, description, importance_score, influence_score, emotional_tone, relationship_summary)
            VALUES ($1,$2,$3,$4,$5,$6,$7,$8)`,
-          [creatorId, r.name, r.relationship_type, r.description, r.importance_score ?? 50, r.influence_score ?? 50, r.emotional_tone, r.relationship_summary]
+          [creatorId, r.name, r.relationship_type, r.description, toScore(r.importance_score), toScore(r.influence_score), r.emotional_tone, r.relationship_summary]
         );
       }
     }
@@ -140,7 +141,7 @@ export async function saveExtractionPg(creatorId, sessionId, extracted) {
         await client.query(
           `INSERT INTO legacy_values (creator_id, value_name, description, importance_score, confidence_score, supporting_stories, origin_story, is_core)
            VALUES ($1,$2,$3,$4,$5,$6,$7,$8)`,
-          [creatorId, v.value_name, v.description, v.importance_score ?? 50, v.confidence_score ?? 50, v.supporting_stories || [], v.origin_story, v.is_core ?? false]
+          [creatorId, v.value_name, v.description, toScore(v.importance_score), toScore(v.confidence_score), v.supporting_stories || [], v.origin_story, v.is_core ?? false]
         );
       }
     }
@@ -150,7 +151,7 @@ export async function saveExtractionPg(creatorId, sessionId, extracted) {
         await client.query(
           `INSERT INTO legacy_wisdom (creator_id, title, advice_statement, life_category, supporting_story, supporting_value, confidence_score, importance_score)
            VALUES ($1,$2,$3,$4,$5,$6,$7,$8)`,
-          [creatorId, w.title, w.advice_statement, w.life_category, w.supporting_story, w.supporting_value, w.confidence_score ?? 50, w.importance_score ?? 50]
+          [creatorId, w.title, w.advice_statement, w.life_category, w.supporting_story, w.supporting_value, toScore(w.confidence_score), toScore(w.importance_score)]
         );
       }
     }
@@ -160,7 +161,7 @@ export async function saveExtractionPg(creatorId, sessionId, extracted) {
         await client.query(
           `INSERT INTO legacy_threads (creator_id, session_id, title, origin_statement, priority, category, status, related_people)
            VALUES ($1,$2,$3,$4,$5,$6,'open',$7)`,
-          [creatorId, sessionId, t.title, t.origin_statement, t.priority || 'medium', t.category, t.related_people || []]
+          [creatorId, sessionId, t.title, t.origin_statement, toImportanceWord(t.priority), t.category, t.related_people || []]
         );
       }
     }
@@ -170,7 +171,7 @@ export async function saveExtractionPg(creatorId, sessionId, extracted) {
         await client.query(
           `INSERT INTO legacy_coverage (creator_id, category, score, updated_at) VALUES ($1,$2,$3,now())
            ON CONFLICT (creator_id, category) DO UPDATE SET score = EXCLUDED.score, updated_at = now()`,
-          [creatorId, cat, score]
+          [creatorId, cat, toScore(score, 0)]
         );
       }
     }
@@ -230,7 +231,7 @@ export async function saveExtractionPg(creatorId, sessionId, extracted) {
         completion_score = GREATEST(completion_score, $3),
         updated_at = now()
        WHERE id = $1`,
-      [creatorId, extracted.avatar_level ?? 1, extracted.completion_score ?? 0]
+      [creatorId, Number.parseInt(extracted.avatar_level, 10) || 1, toScore(extracted.completion_score, 0)]
     );
 
     await client.query('COMMIT');

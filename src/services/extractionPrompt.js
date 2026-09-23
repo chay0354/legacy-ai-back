@@ -48,7 +48,8 @@ Follow the Legacy Interview Blueprint principles:
 - The life timeline is built ONLY from saved memories. Every dated life event must live in the memories array — not in relationships, values, wisdom, or threads alone.
 - Do not duplicate memories: one memory per distinct event. If the same story was captured in a prior session, skip it. Do not re-insert the same title+year or the same story with slightly different wording.
 - Preserve contradictions if present — do not resolve them.
-- Assign importance: low | medium | high | critical for stories and relationships.
+- Memory "importance" and thread "priority" are words: low | medium | high | critical.
+- Every field named *_score, plus coverage values and completion_score, must be a plain NUMBER from 0 to 100 — never a word like "low" and never a string like "80%".
 
 Return ONLY valid JSON matching this exact schema (no markdown fences, no text before or after the JSON object):
 {

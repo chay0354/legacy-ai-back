@@ -3,6 +3,7 @@ import { getExtractionSystem, buildExtractionUserMessage } from './extractionPro
 import { saveExtractionPg } from '../db/legacyRepo.js';
 import { getCoverageCategoriesForStage, stageCompleteLevel } from '../interviewStages.js';
 import { filterNewMemories } from './memoryDedupe.js';
+import { normalizeExtraction, toImportanceWord, toScore } from './extractionNormalize.js';
 import { mergeExclusions } from './topicExclusions.js';
 import { loadCreatorIdentity } from './genderProfile.js';
 
@@ -69,7 +70,7 @@ async function saveExtractionSupabase(supabase, creatorId, sessionId, extracted,
       year_confidence: m.year_confidence,
       emotional_significance: m.emotional_significance,
       lesson_learned: m.lesson_learned,
-      importance: m.importance || 'medium',
+      importance: toImportanceWord(m.importance),
       metadata: {},
     }));
     const { error } = await supabase.from('legacy_memories').insert(rows);
@@ -83,8 +84,8 @@ async function saveExtractionSupabase(supabase, creatorId, sessionId, extracted,
       name: r.name,
       relationship_type: r.relationship_type,
       description: r.description,
-      importance_score: r.importance_score ?? 50,
-      influence_score: r.influence_score ?? 50,
+      importance_score: toScore(r.importance_score),
+      influence_score: toScore(r.influence_score),
       emotional_tone: r.emotional_tone,
       relationship_summary: r.relationship_summary,
       metadata: {},
@@ -98,8 +99,8 @@ async function saveExtractionSupabase(supabase, creatorId, sessionId, extracted,
       creator_id: creatorId,
       value_name: v.value_name,
       description: v.description,
-      importance_score: v.importance_score ?? 50,
-      confidence_score: v.confidence_score ?? 50,
+      importance_score: toScore(v.importance_score),
+      confidence_score: toScore(v.confidence_score),
       supporting_stories: v.supporting_stories || [],
       origin_story: v.origin_story,
       is_core: v.is_core ?? false,
@@ -117,8 +118,8 @@ async function saveExtractionSupabase(supabase, creatorId, sessionId, extracted,
       life_category: w.life_category,
       supporting_story: w.supporting_story,
       supporting_value: w.supporting_value,
-      confidence_score: w.confidence_score ?? 50,
-      importance_score: w.importance_score ?? 50,
+      confidence_score: toScore(w.confidence_score),
+      importance_score: toScore(w.importance_score),
       metadata: {},
     }));
     const { error } = await supabase.from('legacy_wisdom').insert(rows);
@@ -144,7 +145,7 @@ async function saveExtractionSupabase(supabase, creatorId, sessionId, extracted,
   if (extracted.coverage) {
     for (const [cat, score] of Object.entries(extracted.coverage)) {
       const { error } = await supabase.from('legacy_coverage').upsert(
-        { creator_id: creatorId, category: cat, score, updated_at: new Date().toISOString() },
+        { creator_id: creatorId, category: cat, score: toScore(score, 0), updated_at: new Date().toISOString() },
         { onConflict: 'creator_id,category' }
       );
       if (error) throw error;
@@ -206,7 +207,7 @@ async function saveExtractionSupabase(supabase, creatorId, sessionId, extracted,
 
   const minLevel = stageCompleteLevel(stage);
   const newLevel = Math.max(existingCreator?.avatar_level ?? 0, extracted.avatar_level ?? minLevel, minLevel);
-  const newScore = Math.max(existingCreator?.completion_score ?? 0, extracted.completion_score ?? 0);
+  const newScore = Math.max(existingCreator?.completion_score ?? 0, toScore(extracted.completion_score, 0));
 
   const { error: creatorUpdErr } = await supabase
     .from('legacy_creators')
@@ -259,7 +260,7 @@ export async function processInterviewSession({
     extracted = buildFallbackExtraction(normalized, name, stage);
   }
 
-  extracted.avatar_level = Math.max(extracted.avatar_level ?? minLevel, minLevel);
+  normalizeExtraction(extracted, { minLevel });
   extracted._topicExclusions = mergeExclusions(
     topicExclusions,
     extracted.personality?.topic_exclusions,
