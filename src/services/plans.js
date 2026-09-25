@@ -153,8 +153,22 @@ const PRICE_ENV = {
 /** Plans that mean the $699 starting package (or a full later plan) is already done. */
 const SETUP_COMPLETE_PLANS = new Set(['setup', 'monthly', 'storage', 'archive', 'family']);
 
+const priceOverrides = {};
+
+export function setPriceOverride(planId, amountCents, stripePriceId) {
+  if (!PLANS[planId] || !Number.isFinite(amountCents)) return;
+  priceOverrides[planId] = {
+    amount: amountCents,
+    stripePriceId: stripePriceId || '',
+  };
+}
+
 export function getPlan(id) {
-  return PLANS[id] || null;
+  const base = PLANS[id];
+  if (!base) return null;
+  const over = priceOverrides[id];
+  if (!over) return base;
+  return { ...base, amount: over.amount };
 }
 
 export function priceEnvName(planId) {
@@ -168,13 +182,20 @@ export function setResolvedPrice(planId, priceId) {
 }
 
 export function priceIdForPlan(planId) {
-  return process.env[priceEnvName(planId)] || resolvedPrices[planId] || '';
+  return priceOverrides[planId]?.stripePriceId
+    || process.env[priceEnvName(planId)]
+    || resolvedPrices[planId]
+    || '';
 }
 
 export function planIdFromPriceId(priceId) {
   if (!priceId) return null;
   for (const id of PLAN_IDS) {
-    if (priceId === process.env[PRICE_ENV[id]] || priceId === resolvedPrices[id]) return id;
+    if (
+      priceId === priceOverrides[id]?.stripePriceId
+      || priceId === process.env[PRICE_ENV[id]]
+      || priceId === resolvedPrices[id]
+    ) return id;
   }
   return null;
 }

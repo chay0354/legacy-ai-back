@@ -17,6 +17,7 @@ import {
   syncCheckoutSession,
 } from '../services/stripeBilling.js';
 import { getBillingByUserId } from '../db/billingRepo.js';
+import { loadPriceOverrides } from '../services/planPrices.js';
 import { getAdminClient } from '../middleware/auth.js';
 
 const router = Router();
@@ -79,7 +80,12 @@ export function billingWebhookHandler() {
   ];
 }
 
-router.get('/plans', (_req, res) => {
+router.get('/plans', async (_req, res) => {
+  try {
+    await loadPriceOverrides();
+  } catch (err) {
+    console.warn('[prices] plans list:', err.message);
+  }
   const plans = publicPlans();
   res.json({
     plans,
@@ -104,6 +110,7 @@ router.post('/checkout', async (req, res) => {
     if (!planId || !['setup', 'monthly', 'storage', 'addon'].includes(planId)) {
       return res.status(400).json({ error: 'Choose the Package, Monthly, Storage, or a 30 minute add-on.' });
     }
+    await loadPriceOverrides();
     const spec = getPlan(planId);
     const priceId = await resolvePriceId(planId);
     if (!priceId) return res.status(503).json({ error: `Missing Stripe price for ${planId}` });

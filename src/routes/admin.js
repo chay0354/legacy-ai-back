@@ -4,6 +4,7 @@ import {
   adminConfigured, credentialsMatch, requireAdmin, signAdminToken,
 } from '../middleware/adminAuth.js';
 import { getPlan, planCountsAsSetup } from '../services/plans.js';
+import { editablePriceList, loadPriceOverrides, updatePlanPrice } from '../services/planPrices.js';
 import { grantMissingPlans } from '../services/grantMissingPlans.js';
 import { publicBilling, stripeClient, stripeConfigured } from '../services/stripeBilling.js';
 import { getBillingByUserId, upsertBilling } from '../db/billingRepo.js';
@@ -131,6 +132,24 @@ router.post('/login', (req, res) => {
   }
   const token = signAdminToken(String(email).trim().toLowerCase());
   res.json({ token, email: String(email).trim().toLowerCase(), expiresInHours: 12 });
+});
+
+router.get('/prices', requireAdmin, async (_req, res) => {
+  try {
+    await loadPriceOverrides();
+    res.json({ prices: editablePriceList() });
+  } catch (err) {
+    res.status(err.status || 500).json({ error: err.message });
+  }
+});
+
+router.post('/prices', requireAdmin, async (req, res) => {
+  try {
+    const price = await updatePlanPrice(String(req.body?.plan || ''), req.body?.dollars);
+    res.json({ price, prices: editablePriceList() });
+  } catch (err) {
+    res.status(err.status || 500).json({ error: err.message });
+  }
 });
 
 router.get('/overview', requireAdmin, async (_req, res) => {

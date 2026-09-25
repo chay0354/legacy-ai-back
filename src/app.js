@@ -10,6 +10,7 @@ import authRouter from './routes/auth.js';
 import billingRouter, { billingWebhookHandler } from './routes/billing.js';
 import adminRouter from './routes/admin.js';
 import { publicPlans } from './services/plans.js';
+import { loadPriceOverrides } from './services/planPrices.js';
 import { stripeConfigured } from './services/stripeBilling.js';
 import { ensureSchema, getPool } from './db/pool.js';
 
@@ -92,7 +93,12 @@ export function createApp() {
 
   app.use('/api/auth', authRouter);
   app.use('/api/admin', adminRouter);
-  app.get('/api/billing/plans', (_req, res) => {
+  app.get('/api/billing/plans', async (_req, res) => {
+    try {
+      await loadPriceOverrides();
+    } catch (err) {
+      console.warn('[prices] plans list:', err.message);
+    }
     res.json({
       plans: publicPlans(),
       entryPlan: 'setup',
