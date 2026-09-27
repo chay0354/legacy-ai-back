@@ -5,6 +5,7 @@ import {
 } from '../middleware/adminAuth.js';
 import { getPlan, planCountsAsSetup } from '../services/plans.js';
 import { editablePriceList, loadPriceOverrides, updatePlanPrice } from '../services/planPrices.js';
+import { readTheme, writeTheme } from '../services/designTheme.js';
 import { grantMissingPlans } from '../services/grantMissingPlans.js';
 import { publicBilling, stripeClient, stripeConfigured } from '../services/stripeBilling.js';
 import { getBillingByUserId, upsertBilling } from '../db/billingRepo.js';
@@ -132,6 +133,23 @@ router.post('/login', (req, res) => {
   }
   const token = signAdminToken(String(email).trim().toLowerCase());
   res.json({ token, email: String(email).trim().toLowerCase(), expiresInHours: 12 });
+});
+
+router.get('/theme', requireAdmin, async (_req, res) => {
+  try {
+    res.json({ tokens: await readTheme() });
+  } catch (err) {
+    res.status(err.status || 500).json({ error: err.message });
+  }
+});
+
+router.put('/theme', requireAdmin, async (req, res) => {
+  try {
+    const tokens = await writeTheme(req.body?.tokens);
+    res.json({ tokens });
+  } catch (err) {
+    res.status(err.status || 500).json({ error: err.message });
+  }
 });
 
 router.get('/prices', requireAdmin, async (_req, res) => {
