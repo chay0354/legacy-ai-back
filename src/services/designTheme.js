@@ -62,9 +62,9 @@ function clamp(n, min, max) {
 }
 
 function validContentKey(key) {
-  if (typeof key !== 'string' || key.length < 3 || key.length > 700 || !key.startsWith('/')) return false;
+  if (typeof key !== 'string' || key.length < 3 || key.length > 4000 || !key.startsWith('/')) return false;
   const parts = key.split(SEP);
-  return parts.length >= 2 && parts.every((part) => part.length > 0 && part.length < 500);
+  return parts.length >= 2 && parts.every((part) => part.length > 0 && part.length < 2500);
 }
 
 function collectNudges(input, limit) {
@@ -87,11 +87,11 @@ function sanitizeContent(input) {
   const copyIn = src.copy && typeof src.copy === 'object' ? src.copy : {};
   const copy = {};
   for (const [key, value] of Object.entries(copyIn)) {
-    if (Object.keys(copy).length >= 400) break;
+    if (Object.keys(copy).length >= 800) break;
     if (!validContentKey(key) || typeof value !== 'string') continue;
     const text = value.trim();
     const original = key.split(SEP).slice(1).join(SEP);
-    if (!text || text.length > 800 || text === original) continue;
+    if (!text || text.length > 2000 || text === original) continue;
     copy[key] = text;
   }
   return {
