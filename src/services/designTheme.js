@@ -52,6 +52,7 @@ export function sanitizeTheme(input) {
   if (Object.keys(content.copy).length) out.copy = content.copy;
   if (Object.keys(content.images).length) out.images = content.images;
   if (Object.keys(content.blocks).length) out.blocks = content.blocks;
+  if (Object.keys(content.styles).length) out.styles = content.styles;
   return out;
 }
 
@@ -98,7 +99,21 @@ function sanitizeContent(input) {
     copy,
     images: collectNudges(src.images, 200),
     blocks: collectNudges(src.blocks, 200),
+    styles: collectStyles(src.styles, 400),
   };
+}
+
+function collectStyles(input, limit) {
+  const out = {};
+  for (const [key, value] of Object.entries(input && typeof input === 'object' ? input : {})) {
+    if (Object.keys(out).length >= limit) break;
+    if (!validContentKey(key) || !value || typeof value !== 'object') continue;
+    const style = {};
+    if (typeof value.color === 'string' && /^#[0-9a-f]{6}$/i.test(value.color)) style.color = value.color.toLowerCase();
+    if (typeof value.background === 'string' && /^#[0-9a-f]{6}$/i.test(value.background)) style.background = value.background.toLowerCase();
+    if (Object.keys(style).length) out[key] = style;
+  }
+  return out;
 }
 
 function missingTable(error) {
