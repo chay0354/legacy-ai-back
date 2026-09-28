@@ -51,6 +51,7 @@ export function sanitizeTheme(input) {
   const content = sanitizeContent(src);
   if (Object.keys(content.copy).length) out.copy = content.copy;
   if (Object.keys(content.images).length) out.images = content.images;
+  if (Object.keys(content.blocks).length) out.blocks = content.blocks;
   return out;
 }
 
@@ -61,36 +62,43 @@ function clamp(n, min, max) {
 }
 
 function validContentKey(key) {
-  if (typeof key !== 'string' || key.length < 3 || key.length > 360 || !key.startsWith('/')) return false;
+  if (typeof key !== 'string' || key.length < 3 || key.length > 700 || !key.startsWith('/')) return false;
   const parts = key.split(SEP);
-  return parts.length >= 2 && parts.every((part) => part.length > 0 && part.length < 220);
+  return parts.length >= 2 && parts.every((part) => part.length > 0 && part.length < 500);
+}
+
+function collectNudges(input, limit) {
+  const out = {};
+  for (const [key, value] of Object.entries(input || {})) {
+    if (Object.keys(out).length >= limit) break;
+    if (!validContentKey(key) || !value || typeof value !== 'object') continue;
+    const scale = clamp(Math.round(Number(value.scale) * 100) / 100, 0.5, 2);
+    const x = clamp(Math.round(Number(value.x)), -480, 480);
+    const y = clamp(Math.round(Number(value.y)), -480, 480);
+    if (!Number.isFinite(scale) || !Number.isFinite(x) || !Number.isFinite(y)) continue;
+    if (scale === 1 && x === 0 && y === 0) continue;
+    out[key] = { scale, x, y };
+  }
+  return out;
 }
 
 function sanitizeContent(input) {
   const src = input && typeof input === 'object' ? input : {};
   const copyIn = src.copy && typeof src.copy === 'object' ? src.copy : {};
-  const imagesIn = src.images && typeof src.images === 'object' ? src.images : {};
   const copy = {};
   for (const [key, value] of Object.entries(copyIn)) {
-    if (Object.keys(copy).length >= 80) break;
+    if (Object.keys(copy).length >= 400) break;
     if (!validContentKey(key) || typeof value !== 'string') continue;
     const text = value.trim();
     const original = key.split(SEP).slice(1).join(SEP);
-    if (!text || text.length > 400 || text === original) continue;
+    if (!text || text.length > 800 || text === original) continue;
     copy[key] = text;
   }
-  const images = {};
-  for (const [key, value] of Object.entries(imagesIn)) {
-    if (Object.keys(images).length >= 80) break;
-    if (!validContentKey(key) || !value || typeof value !== 'object') continue;
-    const scale = clamp(Math.round(Number(value.scale) * 100) / 100, 0.6, 1.8);
-    const x = clamp(Math.round(Number(value.x)), -240, 240);
-    const y = clamp(Math.round(Number(value.y)), -240, 240);
-    if (!Number.isFinite(scale) || !Number.isFinite(x) || !Number.isFinite(y)) continue;
-    if (scale === 1 && x === 0 && y === 0) continue;
-    images[key] = { scale, x, y };
-  }
-  return { copy, images };
+  return {
+    copy,
+    images: collectNudges(src.images, 200),
+    blocks: collectNudges(src.blocks, 200),
+  };
 }
 
 function missingTable(error) {
