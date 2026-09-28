@@ -48,7 +48,49 @@ export function sanitizeTheme(input) {
       if (hex !== DEFAULTS[key]) out[key] = hex;
     }
   }
+  const content = sanitizeContent(src);
+  if (Object.keys(content.copy).length) out.copy = content.copy;
+  if (Object.keys(content.images).length) out.images = content.images;
   return out;
+}
+
+const SEP = '\u001f';
+
+function clamp(n, min, max) {
+  return Math.min(max, Math.max(min, n));
+}
+
+function validContentKey(key) {
+  if (typeof key !== 'string' || key.length < 3 || key.length > 360 || !key.startsWith('/')) return false;
+  const parts = key.split(SEP);
+  return parts.length >= 2 && parts.every((part) => part.length > 0 && part.length < 220);
+}
+
+function sanitizeContent(input) {
+  const src = input && typeof input === 'object' ? input : {};
+  const copyIn = src.copy && typeof src.copy === 'object' ? src.copy : {};
+  const imagesIn = src.images && typeof src.images === 'object' ? src.images : {};
+  const copy = {};
+  for (const [key, value] of Object.entries(copyIn)) {
+    if (Object.keys(copy).length >= 80) break;
+    if (!validContentKey(key) || typeof value !== 'string') continue;
+    const text = value.trim();
+    const original = key.split(SEP).slice(1).join(SEP);
+    if (!text || text.length > 400 || text === original) continue;
+    copy[key] = text;
+  }
+  const images = {};
+  for (const [key, value] of Object.entries(imagesIn)) {
+    if (Object.keys(images).length >= 80) break;
+    if (!validContentKey(key) || !value || typeof value !== 'object') continue;
+    const scale = clamp(Math.round(Number(value.scale) * 100) / 100, 0.6, 1.8);
+    const x = clamp(Math.round(Number(value.x)), -240, 240);
+    const y = clamp(Math.round(Number(value.y)), -240, 240);
+    if (!Number.isFinite(scale) || !Number.isFinite(x) || !Number.isFinite(y)) continue;
+    if (scale === 1 && x === 0 && y === 0) continue;
+    images[key] = { scale, x, y };
+  }
+  return { copy, images };
 }
 
 function missingTable(error) {
