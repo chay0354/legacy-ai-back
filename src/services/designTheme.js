@@ -53,6 +53,7 @@ export function sanitizeTheme(input) {
   if (Object.keys(content.images).length) out.images = content.images;
   if (Object.keys(content.blocks).length) out.blocks = content.blocks;
   if (Object.keys(content.styles).length) out.styles = content.styles;
+  if (Object.keys(content.added).length) out.added = content.added;
   return out;
 }
 
@@ -100,7 +101,28 @@ function sanitizeContent(input) {
     images: collectNudges(src.images, 200),
     blocks: collectNudges(src.blocks, 200),
     styles: collectStyles(src.styles, 400),
+    added: collectAdded(src.added, 100),
   };
+}
+
+function collectAdded(input, limit) {
+  const out = {};
+  for (const [key, value] of Object.entries(input && typeof input === 'object' ? input : {})) {
+    if (Object.keys(out).length >= limit) break;
+    if (!validContentKey(key) || !key.includes(`${SEP}add:`) || !value || typeof value !== 'object') continue;
+    if (!validContentKey(value.after)) continue;
+    if (value.kind === 'text') {
+      const text = typeof value.text === 'string' ? value.text.trim() : '';
+      if (!text || text.length > 2000) continue;
+      out[key] = { kind: 'text', after: value.after, text };
+    } else if (value.kind === 'image') {
+      const src = typeof value.src === 'string' ? value.src.trim() : '';
+      if (!/^https:\/\/\S+$/.test(src) || src.length > 1000) continue;
+      const alt = typeof value.alt === 'string' ? value.alt.trim().slice(0, 300) : '';
+      out[key] = { kind: 'image', after: value.after, src, ...(alt ? { alt } : {}) };
+    }
+  }
+  return out;
 }
 
 function collectStyles(input, limit) {

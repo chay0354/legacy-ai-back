@@ -152,6 +152,34 @@ router.put('/theme', requireAdmin, async (req, res) => {
   }
 });
 
+const SITE_BUCKET = 'site-assets';
+const IMAGE_TYPES = { 'image/jpeg': 'jpg', 'image/png': 'png', 'image/webp': 'webp', 'image/gif': 'gif' };
+
+router.post('/theme/image', requireAdmin, async (req, res) => {
+  try {
+    const admin = getAdminClient();
+    if (!admin) return res.status(503).json({ error: 'Supabase service role is not configured.' });
+    const type = String(req.body?.type || '');
+    const ext = IMAGE_TYPES[type];
+    if (!ext) return res.status(400).json({ error: 'Use a JPG, PNG, WebP, or GIF picture.' });
+    const buffer = Buffer.from(String(req.body?.data || ''), 'base64');
+    if (!buffer.length) return res.status(400).json({ error: 'The picture is empty.' });
+    if (buffer.length > 8 * 1024 * 1024) return res.status(413).json({ error: 'Pictures must be under 8 MB.' });
+    const path = `site/${Date.now()}-${Math.random().toString(36).slice(2, 10)}.${ext}`;
+    const put = () => admin.storage.from(SITE_BUCKET).upload(path, buffer, { contentType: type, upsert: false });
+    let { error } = await put();
+    if (error && /bucket not found|not found/i.test(error.message)) {
+      await admin.storage.createBucket(SITE_BUCKET, { public: true });
+      ({ error } = await put());
+    }
+    if (error) return res.status(500).json({ error: error.message });
+    const { data } = admin.storage.from(SITE_BUCKET).getPublicUrl(path);
+    res.json({ url: data.publicUrl });
+  } catch (err) {
+    res.status(err.status || 500).json({ error: err.message });
+  }
+});
+
 router.get('/prices', requireAdmin, async (_req, res) => {
   try {
     await loadPriceOverrides();
