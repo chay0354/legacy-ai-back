@@ -91,7 +91,7 @@ function sanitizeContent(input) {
   for (const [key, value] of Object.entries(copyIn)) {
     if (Object.keys(copy).length >= 800) break;
     if (!validContentKey(key) || typeof value !== 'string') continue;
-    const text = value.trim();
+    const text = sanitizeRich(value.trim());
     const original = key.split(SEP).slice(1).join(SEP);
     if (!text || text.length > 2000 || text === original) continue;
     copy[key] = text;
@@ -105,6 +105,16 @@ function sanitizeContent(input) {
   };
 }
 
+function sanitizeRich(value) {
+  return String(value)
+    .replace(/<\s*(\/?)\s*(strong|b)\s*>/gi, '<$1b>')
+    .replace(/<\s*(\/?)\s*(em|i)\s*>/gi, '<$1i>')
+    .replace(/<br\s*\/?\s*>/gi, '\n')
+    .replace(/<[^>]*>/g, '')
+    .replace(/\n+$/g, '')
+    .trim();
+}
+
 function collectAdded(input, limit) {
   const out = {};
   for (const [key, value] of Object.entries(input && typeof input === 'object' ? input : {})) {
@@ -112,7 +122,7 @@ function collectAdded(input, limit) {
     if (!validContentKey(key) || !key.includes(`${SEP}add:`) || !value || typeof value !== 'object') continue;
     if (!validContentKey(value.after)) continue;
     if (value.kind === 'text') {
-      const text = typeof value.text === 'string' ? value.text.trim() : '';
+      const text = sanitizeRich(typeof value.text === 'string' ? value.text.trim() : '');
       if (!text || text.length > 2000) continue;
       out[key] = { kind: 'text', after: value.after, text };
     } else if (value.kind === 'image') {
