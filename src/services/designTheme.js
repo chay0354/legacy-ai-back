@@ -54,6 +54,7 @@ export function sanitizeTheme(input) {
   if (Object.keys(content.blocks).length) out.blocks = content.blocks;
   if (Object.keys(content.styles).length) out.styles = content.styles;
   if (Object.keys(content.added).length) out.added = content.added;
+  if (Object.keys(content.fills).length) out.fills = content.fills;
   return out;
 }
 
@@ -102,7 +103,20 @@ function sanitizeContent(input) {
     blocks: collectNudges(src.blocks, 200),
     styles: collectStyles(src.styles, 400),
     added: collectAdded(src.added, 100),
+    fills: collectFills(src.fills, 200),
   };
+}
+
+function collectFills(input, limit) {
+  const out = {};
+  for (const [key, value] of Object.entries(input && typeof input === 'object' ? input : {})) {
+    if (Object.keys(out).length >= limit) break;
+    if (!validContentKey(key)) continue;
+    const src = typeof value === 'string' ? value.trim() : '';
+    if (!/^https:\/\/\S+$/.test(src) || src.length > 1000) continue;
+    out[key] = src;
+  }
+  return out;
 }
 
 function sanitizeRich(value) {
