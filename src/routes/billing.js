@@ -7,9 +7,12 @@ import {
 import {
   applyCheckoutSession,
   applySubscriptionEvent,
+  assertListedPrice,
   billingForUser,
   hasCompletedSetup,
   listBillingHistory,
+  liveSubscriptionForCustomer,
+  persistSubscription,
   rememberCustomer,
   resolvePriceId,
   stripeClient,
@@ -68,7 +71,10 @@ export function billingWebhookHandler() {
           const subId = typeof invoice.subscription === 'string' ? invoice.subscription : invoice.subscription?.id;
           if (subId) {
             const subscription = await stripe.subscriptions.retrieve(subId);
-            await applySubscriptionEvent(ctx, subscription);
+            const grantMinutes = event.type === 'invoice.paid' && invoice.billing_reason === 'subscription_cycle'
+              ? 'cycle'
+              : null;
+            await applySubscriptionEvent(ctx, subscription, { grantMinutes });
           }
         }
       } catch (err) {
@@ -114,6 +120,7 @@ router.post('/checkout', async (req, res) => {
     const spec = getPlan(planId);
     const priceId = await resolvePriceId(planId);
     if (!priceId) return res.status(503).json({ error: `Missing Stripe price for ${planId}` });
+    await assertListedPrice(planId, priceId);
 
     const stripe = stripeClient();
     const existing = await getBillingByUserId(req, req.user.id);
@@ -148,6 +155,30 @@ router.post('/checkout', async (req, res) => {
     }
 
     const front = frontendBase(req);
+    if (planId === 'monthly' || planId === 'storage') {
+      const live = await liveSubscriptionForCustomer(customerId, existing?.stripeSubscriptionId);
+      const item = live?.items?.data?.[0];
+      if (live && item) {
+        if (item.price?.id === priceId) {
+          return res.status(400).json({ error: 'You are already on this plan.' });
+        }
+        const updated = await stripe.subscriptions.update(live.id, {
+          items: [{ id: item.id, price: priceId }],
+          proration_behavior: 'always_invoice',
+          payment_behavior: 'error_if_incomplete',
+          cancel_at_period_end: false,
+          metadata: { userId: req.user.id, plan: planId },
+        });
+        await persistSubscription(req, {
+          userId: req.user.id,
+          customerId,
+          subscription: updated,
+          checkoutPaid: true,
+          grantMinutes: 'plan',
+        });
+        return res.json({ url: `${front}/billing`, sessionId: null, plan: planId, switched: true });
+      }
+    }
     const mode = spec.checkoutMode === 'payment' ? 'payment' : 'subscription';
     const params = {
       mode,

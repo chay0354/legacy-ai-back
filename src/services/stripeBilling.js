@@ -34,7 +34,7 @@ export async function resolvePriceId(planId) {
       p.unit_amount === plan.amount
       && p.currency === plan.currency
       && (plan.interval ? p.recurring?.interval === plan.interval : !p.recurring),
-    ) || prices.data[0];
+    );
     if (!match?.id) return '';
     setResolvedPrice(planId, match.id);
     return match.id;
@@ -42,6 +42,46 @@ export async function resolvePriceId(planId) {
     console.warn('[billing] could not resolve Stripe price for', planId, e.message);
     return '';
   }
+}
+
+/** Refuse checkout when the Stripe Price amount or interval is not the price we list. */
+export async function assertListedPrice(planId, priceId) {
+  const spec = getPlan(planId);
+  const price = await stripeClient().prices.retrieve(priceId);
+  const intervalOk = spec?.interval
+    ? price.recurring?.interval === spec.interval
+    : !price.recurring;
+  const matches = Boolean(
+    spec
+    && price.active
+    && price.currency === spec.currency
+    && price.unit_amount === spec.amount
+    && intervalOk,
+  );
+  if (!matches) {
+    const err = new Error('The payment price does not match the listed price. Nothing was charged.');
+    err.status = 409;
+    throw err;
+  }
+  return price;
+}
+
+const LIVE_SUB_STATUSES = new Set(['active', 'trialing', 'past_due']);
+
+/** The subscription we should change, instead of opening a second one. */
+export async function liveSubscriptionForCustomer(customerId, preferredId) {
+  if (!customerId) return null;
+  const stripe = stripeClient();
+  if (preferredId) {
+    try {
+      const current = await stripe.subscriptions.retrieve(preferredId);
+      if (LIVE_SUB_STATUSES.has(current.status)) return current;
+    } catch {
+      /* stored id can be stale */
+    }
+  }
+  const list = await stripe.subscriptions.list({ customer: customerId, status: 'all', limit: 20 });
+  return list.data.find((s) => LIVE_SUB_STATUSES.has(s.status)) || null;
 }
 
 export function hasCompletedSetup(row) {
@@ -260,7 +300,26 @@ function paidEnoughStatus(status, checkoutPaid) {
   return s || 'none';
 }
 
-export async function persistSubscription(req, { userId, customerId, subscription, checkoutPaid = false }) {
+/**
+ * cycle: a renewal invoice — replace the allowance with this plan's included minutes.
+ * plan: the customer changed plans — grant the new plan, and keep unused Package minutes
+ *       when moving onto Monthly so the $699 minutes are not thrown away.
+ * omitted: a status update — leave the balance exactly as it is, including zero.
+ */
+export function minutesAfterSubscription({ existing, resolved, spec, grant }) {
+  const included = spec?.minutes || 0;
+  const had = Number(existing?.minutesRemaining) || 0;
+  const prev = existing?.plan;
+  if (grant === 'cycle') return included;
+  if (grant === 'plan' || (prev && prev !== 'none' && prev !== resolved)) {
+    if (resolved === 'monthly' && planUsesMinutes(prev)) return Math.max(had, included);
+    return included;
+  }
+  if (!existing || !prev || prev === 'none') return included;
+  return had;
+}
+
+export async function persistSubscription(req, { userId, customerId, subscription, checkoutPaid = false, grantMinutes = null }) {
   const existing = await getBillingByUserId(req, userId);
   if (
     existing?.stripeSubscriptionId
@@ -280,7 +339,6 @@ export async function persistSubscription(req, { userId, customerId, subscriptio
     || 'monthly';
   const resolved = getPlan(plan) ? plan : 'monthly';
   const spec = getPlan(resolved);
-  const existingMinutes = Number(existing?.minutesRemaining) || 0;
   return upsertBilling(req, {
     userId,
     stripeCustomerId: customerId || subscription?.customer || null,
@@ -291,7 +349,7 @@ export async function persistSubscription(req, { userId, customerId, subscriptio
     currentPeriodEnd: periodEnd(subscription),
     cancelAtPeriodEnd: Boolean(subscription?.cancel_at_period_end),
     source: 'stripe',
-    minutesRemaining: existingMinutes > 0 ? existingMinutes : (spec?.minutes || 0),
+    minutesRemaining: minutesAfterSubscription({ existing, resolved, spec, grant: grantMinutes }),
     setupPurchased: Boolean(existing?.setupPurchased) || planCountsAsSetup(resolved),
   });
 }
@@ -476,7 +534,7 @@ async function userIdFromCustomer(customerId) {
   }
 }
 
-export async function applySubscriptionEvent(req, subscription) {
+export async function applySubscriptionEvent(req, subscription, { grantMinutes = null } = {}) {
   const customerId = typeof subscription.customer === 'string'
     ? subscription.customer
     : subscription.customer?.id;
@@ -487,7 +545,7 @@ export async function applySubscriptionEvent(req, subscription) {
     console.warn('[billing] subscription event with no user', subscription.id);
     return null;
   }
-  return persistSubscription(req, { userId, customerId, subscription });
+  return persistSubscription(req, { userId, customerId, subscription, grantMinutes });
 }
 
 export async function listBillingHistory(req, userId) {

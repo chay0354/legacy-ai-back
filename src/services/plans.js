@@ -228,7 +228,7 @@ export function planCountsAsSetup(id) {
 }
 
 export function addonOffer() {
-  const p = PLANS.addon;
+  const p = getPlan('addon');
   return {
     id: p.id,
     name: p.name,
@@ -249,8 +249,9 @@ export function isPaidStatus(status, currentPeriodEnd) {
 }
 
 export function publicPlans() {
+  const setupPrice = formatMoney(getPlan('setup')?.amount ?? PLANS.setup.amount, 'usd');
   return PUBLIC_PLAN_IDS.map((id) => {
-    const p = PLANS[id];
+    const p = getPlan(id);
     return {
       id: p.id,
       name: p.name,
@@ -259,7 +260,7 @@ export function publicPlans() {
       currency: p.currency,
       interval: p.interval || 'once',
       displayPrice: formatMoney(p.amount, p.currency),
-      lines: p.lines,
+      lines: (p.lines || []).map((line) => line.replaceAll('$699', setupPrice)),
       primary: Boolean(p.primary),
       kind: p.kind || 'plan',
       step: p.step || null,
