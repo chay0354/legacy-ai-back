@@ -5,7 +5,7 @@
 import 'dotenv/config';
 import { createClient } from '@supabase/supabase-js';
 import { unwrapPortraitIfPadded, PORTRAIT_LAYOUT_FULLBLEED } from '../src/services/portraitFix.js';
-import { deleteAvatar as anamDeleteAvatar } from '../src/services/anam.js';
+import { deleteFace as simliDeleteFace } from '../src/services/simli.js';
 
 const BUCKET = 'legacy-media';
 const force = process.argv.includes('--force');
@@ -79,14 +79,13 @@ for (const row of rows || []) {
     continue;
   }
 
-  if (meta.anam_avatar_id) {
-    try { await anamDeleteAvatar(meta.anam_avatar_id); } catch (e) {
-      console.warn('anam delete', meta.anam_avatar_id, e.message);
+  if (meta.simli_face_id) {
+    try { await simliDeleteFace(meta.simli_face_id); } catch (e) {
+      console.warn('simli delete', meta.simli_face_id, e.message);
     }
-    nextMeta.anam_status = 'none';
-    nextMeta.anam_avatar_id = null;
-    nextMeta.anam_avatar_portrait_path = null;
-    nextMeta.anam_avatar_source = null;
+    nextMeta.simli_status = 'none';
+    nextMeta.simli_face_id = null;
+    nextMeta.simli_face_portrait_path = null;
   }
 
   const { error: dbErr } = await sb.from('legacy_avatar_assets').update({

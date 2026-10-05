@@ -1,22 +1,19 @@
 import { Router } from 'express';
-import { cloneVoice as elevenLabsClone, textToSpeech as elevenLabsTts, deleteVoice as elevenLabsDeleteVoice, isInstantCloneLikelyAvailable, markInstantCloneUnavailable } from '../services/elevenlabs.js';
+import { Readable } from 'node:stream';
+import { cloneVoice as elevenLabsClone, textToSpeech as elevenLabsTts, deleteVoice as elevenLabsDeleteVoice, isInstantCloneLikelyAvailable, markInstantCloneUnavailable, streamSpeechPcm16k } from '../services/elevenlabs.js';
 import { AVATAR_GREETING, VOICE_TEST_PHRASE } from '../config/voice.js';
 import { callClaude } from '../services/anthropic.js';
 import {
-  isConfigured as anamConfigured,
-  listAvatars as anamListAvatars,
-  deleteAvatar as anamDeleteAvatar,
-  deleteVoice as anamDeleteVoice,
-  getVoice as anamGetVoice,
-  createAvatar as anamCreateAvatar,
-  cloneVoice as anamCloneVoice,
-  createSessionToken as anamCreateSessionToken,
-  buildSessionOptions as anamBuildSessionOptions,
-  defaultAvatarModel as anamDefaultAvatarModel,
-  voiceEnhanceEnabled as anamVoiceEnhanceEnabled,
-} from '../services/anam.js';
+  isConfigured as simliConfigured,
+  preprocessPortrait as simliPreprocessPortrait,
+  createFace as simliCreateFace,
+  faceStatus as simliFaceStatus,
+  deleteFace as simliDeleteFace,
+  createSessionToken as simliCreateSessionToken,
+} from '../services/simli.js';
+import { createLiveRealtimeSecret, signSpeechTicket, verifySpeechTicket } from '../services/liveCall.js';
 import { makeAccessStore } from '../db/accessRepo.js';
-import { normalizeAnamLanguage } from '../anamLanguages.js';
+import { normalizeLiveLanguage } from '../liveLanguages.js';
 import {
   formatIdentityPromptBlock,
   loadCreatorIdentity,
@@ -35,8 +32,8 @@ function sendAvatarError(res, e, fallback = 500) {
   return res.status(e?.status || fallback).json({ error: e.message });
 }
 
-function resolveAnamLanguage(assets, override) {
-  return normalizeAnamLanguage(override ?? assets?.metadata?.anam_language);
+function resolveLiveLanguage(assets, override) {
+  return normalizeLiveLanguage(override ?? assets?.metadata?.live_language ?? assets?.metadata?.anam_language);
 }
 
 /** Resolve the creator owned by the signed-in user (the avatar's subject). */
@@ -141,240 +138,197 @@ function avatarReady(assets) {
   return Boolean(assets?.portrait_path && voiceReady(assets));
 }
 
-/** True when Anam has a cloned voice for the current sample + selected language — no stock fallback. */
-function anamVoiceReady(assets) {
+/** True when the Simli face for the CURRENT portrait has finished generating. */
+function simliFaceReady(assets) {
   const meta = assets?.metadata || {};
-  if (!meta.anam_voice_id) return false;
-  // Require provenance: legacy rows without sample/language metadata are not "ready"
-  // (they can silently degrade to a stock-sounding Anam default).
-  if (!assets?.voice_sample_path || !meta.anam_voice_sample_path) return false;
-  if (meta.anam_voice_sample_path !== assets.voice_sample_path) return false;
-  const selected = resolveAnamLanguage(assets);
-  if (!meta.anam_voice_language || meta.anam_voice_language !== selected) return false;
-  // Old clones used enhance=true, which washes out identity.
-  if (meta.anam_voice_enhance !== anamVoiceEnhanceEnabled()) return false;
-  return true;
+  return Boolean(
+    meta.simli_face_id
+    && meta.simli_status === 'ready'
+    && assets?.portrait_path
+    && meta.simli_face_portrait_path === assets.portrait_path,
+  );
 }
 
-/** True when the Anam live face AND cloned voice are provisioned. Face alone is not enough. */
-function anamReady(assets) {
-  const meta = assets?.metadata || {};
-  return Boolean(meta.anam_avatar_id && meta.anam_avatar_source === 'upload' && anamVoiceReady(assets));
+/** Live Call needs the creator's own face AND their own cloned voice. Never a stock voice. */
+function liveReady(assets) {
+  return Boolean(simliFaceReady(assets) && resolveElevenLabsVoiceId(assets) && voiceReady(assets));
 }
 
-function anamDisplayName(creator) {
+function simliFaceName(creator) {
   return `${creator.display_name || 'Legacy'} ${creator.id.slice(0, 6)}`.slice(0, 50);
 }
 
-/** Free/starter plans allow few concurrent one-shots — remove stale faces for this creator. */
-async function freeAnamAvatarSlots(creator, keepId = null) {
-  const prefix = creator.id.slice(0, 6);
-  const avatars = await anamListAvatars();
-  for (const a of avatars) {
-    if (a.id === keepId) continue;
-    const name = a.displayName || '';
-    if (name.endsWith(prefix) || name.includes(` ${prefix}`)) {
-      try {
-        await anamDeleteAvatar(a.id);
-        console.info('[avatar/anam] deleted stale avatar', a.id, name);
-      } catch (e) {
-        console.warn('[avatar/anam] could not delete avatar', a.id, e.message);
-      }
-    }
+const SIMLI_POLL_MS = 5000;
+const SIMLI_WAIT_MS = Number(process.env.SIMLI_PROVISION_WAIT_MS) || 270_000;
+const SIMLI_STALE_MS = 20 * 60 * 1000;
+
+/** Ask Simli how a generating face is doing and save the answer. Cheap; safe to call on every load. */
+async function refreshSimliStatus(req, creatorId, assets) {
+  const meta = assets?.metadata || {};
+  if (!simliConfigured() || !meta.simli_face_id || meta.simli_status !== 'processing') return assets;
+  if (meta.simli_face_portrait_path !== assets.portrait_path) return assets;
+  let result;
+  try {
+    result = await simliFaceStatus(meta.simli_face_id);
+  } catch (e) {
+    console.warn('[avatar/simli] status check failed:', e.message);
+    return assets;
   }
+  if (result.status === 'processing') {
+    const startedAt = Date.parse(meta.simli_started_at || '') || 0;
+    if (!startedAt || Date.now() - startedAt < SIMLI_STALE_MS) return assets;
+    result = { status: 'failed', error: 'Creating the live face took too long. Try again.' };
+  }
+  const next = {
+    ...meta,
+    simli_status: result.status,
+    simli_phase: result.status === 'ready' ? 'live_face' : meta.simli_phase,
+    simli_error: result.status === 'failed' ? String(result.error || 'Simli could not build the face') : null,
+    ...(result.status === 'ready' ? { simli_ready_at: new Date().toISOString() } : {}),
+  };
+  const client = req.admin || req.supabase;
+  const { data, error } = await client
+    .from('legacy_avatar_assets')
+    .update({ metadata: next, updated_at: new Date().toISOString() })
+    .eq('creator_id', creatorId)
+    .select()
+    .maybeSingle();
+  if (error) {
+    console.warn('[avatar/simli] status save failed:', error.message);
+    return { ...assets, metadata: next };
+  }
+  return data || { ...assets, metadata: next };
 }
 
-async function createAnamAvatarWithSlotRetry(creator, portrait) {
-  const displayName = anamDisplayName(creator);
+async function readPortraitForFace(req, assets) {
+  const portraitKey = assets.portrait_path;
+  const { data: file, error } = await req.supabase.storage.from(BUCKET).download(portraitKey);
+  if (error || !file) throw new Error(`Could not read the portrait photo: ${error?.message || 'not found'}`);
+  let buffer = Buffer.from(await file.arrayBuffer());
+  if (!buffer.length) throw new Error('Could not read the portrait photo.');
   try {
-    return await anamCreateAvatar({ displayName, ...portrait });
+    const force = assets.metadata?.portrait_layout !== PORTRAIT_LAYOUT_FULLBLEED;
+    const unwrapped = await unwrapPortraitIfPadded(buffer, { force });
+    if (unwrapped.changed) buffer = unwrapped.buffer;
   } catch (e) {
-    if (e.status !== 403 || !/one-shot avatars/i.test(e.message)) throw e;
-    console.warn('[avatar/anam] avatar slot full — cleaning stale one-shots for creator');
-    await freeAnamAvatarSlots(creator);
-    return anamCreateAvatar({ displayName, ...portrait });
+    console.warn('[avatar/provision] portrait unwrap skipped:', e.message);
   }
+  const ext = (portraitKey.split('.').pop() || 'jpg').toLowerCase();
+  const contentType = ext === 'png' ? 'image/png' : ext === 'webp' ? 'image/webp' : 'image/jpeg';
+  const filename = `portrait.${ext === 'png' ? 'png' : ext === 'webp' ? 'webp' : 'jpg'}`;
+
+  // Simli frames the head itself for best lip-sync; fall back to our photo if that step fails.
+  // Trinity-only framing. The current Simli plan uses the legacy face model.
+  if (process.env.SIMLI_FACE_MODEL === 'trinity' && process.env.SIMLI_PREPROCESS !== 'off') {
+    try {
+      const framed = await simliPreprocessPortrait({ buffer, contentType, filename });
+      if (framed?.length) return { buffer: framed, contentType: 'image/png', filename: 'portrait.png' };
+    } catch (e) {
+      console.warn('[avatar/simli] preprocess skipped:', e.message);
+    }
+  }
+  return { buffer, contentType, filename };
 }
 
 /**
- * Provision the live-call assets on Anam from the creator's OWN photo + voice:
- * create a one-shot avatar from the portrait and clone the recorded voice.
- * Idempotent — reuses existing Anam ids when the source media hasn't changed.
+ * Build the creator's live face on Simli from their OWN portrait. The voice is the
+ * ElevenLabs clone made in the Voice step, so nothing else is cloned here.
+ * Idempotent — keeps the existing face while the portrait is unchanged.
+ * With `wait`, polls until the face is ready (or the wait runs out; it keeps generating).
  */
-async function provisionAnam(req, creator) {
-  if (!anamConfigured()) throw new Error('Live calls require ANAM_API_KEY.');
+async function provisionSimli(req, creator, { wait = false } = {}) {
+  if (!simliConfigured()) throw new Error('Live calls require SIMLI_API_KEY.');
 
-  const assets = await getAssets(req, creator.id);
+  let assets = await getAssets(req, creator.id);
   if (!assets?.portrait_path) throw new Error('Add a portrait photo in the Avatar Studio first.');
-  if (!assets?.voice_sample_path) throw new Error('Record your voice in the Avatar Studio first.');
+  if (!voiceReady(assets) || !resolveElevenLabsVoiceId(assets)) {
+    throw new Error('Record and clone your voice in the Avatar Studio first.');
+  }
 
   const meta = assets.metadata || {};
   const portraitKey = assets.portrait_path;
-  const voiceKey = assets.voice_sample_path;
+  const sameFace = meta.simli_face_id && meta.simli_face_portrait_path === portraitKey;
 
-  const language = resolveAnamLanguage(assets);
-  const avatarModel = anamDefaultAvatarModel();
-  const voiceEnhance = anamVoiceEnhanceEnabled();
-  const haveAvatar = meta.anam_avatar_id
-    && meta.anam_avatar_portrait_path === portraitKey
-    && meta.anam_avatar_model === avatarModel
-    && meta.anam_avatar_source === 'upload';
-  const haveVoice = meta.anam_voice_id
-    && meta.anam_voice_sample_path === voiceKey
-    && meta.anam_voice_language === language
-    && meta.anam_voice_enhance === voiceEnhance;
-  if (haveAvatar && haveVoice) return assets;
-
-  await upsertAssets(req, creator.id, {
-    metadata: { ...meta, anam_language: language, anam_status: 'processing', anam_error: null },
-  });
-
-  try {
-    let anamAvatarId = haveAvatar ? meta.anam_avatar_id : null;
-    let anamVoiceId = haveVoice ? meta.anam_voice_id : null;
-
-    if (!anamAvatarId) {
+  if (!(sameFace && (meta.simli_status === 'ready' || meta.simli_status === 'processing'))) {
+    try {
       await upsertAssets(req, creator.id, {
-        metadata: { ...meta, anam_language: language, anam_status: 'processing', anam_phase: 'photo', anam_error: null },
+        metadata: { ...meta, simli_status: 'processing', simli_phase: 'photo', simli_error: null },
       });
-      // Face — upload the stored portrait bytes so Anam does not fetch a signed URL.
-      const { data: portraitFile, error: portraitErr } = await req.supabase.storage.from(BUCKET).download(portraitKey);
-      if (portraitErr || !portraitFile) throw new Error(`Could not read the portrait photo: ${portraitErr?.message || 'not found'}`);
-      let portraitBuffer = Buffer.from(await portraitFile.arrayBuffer());
-      if (!portraitBuffer.length) throw new Error('Could not read the portrait photo.');
-      try {
-        const force = meta.portrait_layout !== PORTRAIT_LAYOUT_FULLBLEED;
-        const unwrapped = await unwrapPortraitIfPadded(portraitBuffer, { force });
-        if (unwrapped.changed) portraitBuffer = unwrapped.buffer;
-      } catch (e) {
-        console.warn('[avatar/provision] portrait unwrap skipped:', e.message);
+      if (meta.simli_face_id && !sameFace) {
+        simliDeleteFace(meta.simli_face_id).catch((e) =>
+          console.warn('[avatar/simli] old face delete failed:', e.message),
+        );
       }
-      const ext = (portraitKey.split('.').pop() || 'jpg').toLowerCase();
-      const portraitType = ext === 'png' ? 'image/png' : ext === 'webp' ? 'image/webp' : 'image/jpeg';
-      const portraitUrl = await signed(req, portraitKey);
-
-      // Portrait / model / upload path changed — drop the previous one-shot so slot limits aren't hit.
-      if (meta.anam_avatar_id && (
-        meta.anam_avatar_portrait_path !== portraitKey
-        || meta.anam_avatar_model !== avatarModel
-        || meta.anam_avatar_source !== 'upload'
-      )) {
-        try {
-          await anamDeleteAvatar(meta.anam_avatar_id);
-        } catch (e) {
-          console.warn('[avatar/anam] old avatar delete failed:', e.message);
-        }
-      }
-      anamAvatarId = await createAnamAvatarWithSlotRetry(creator, {
-        imageBuffer: portraitBuffer,
-        contentType: portraitType,
-        filename: `portrait.${ext === 'png' ? 'png' : ext === 'webp' ? 'webp' : 'jpg'}`,
-        imageUrl: portraitUrl,
+      const portrait = await readPortraitForFace(req, assets);
+      const faceId = await simliCreateFace({ name: simliFaceName(creator), ...portrait });
+      assets = await upsertAssets(req, creator.id, {
+        metadata: {
+          ...meta,
+          simli_face_id: faceId,
+          simli_face_portrait_path: portraitKey,
+          simli_status: 'processing',
+          simli_phase: 'live_face',
+          simli_error: null,
+          simli_started_at: new Date().toISOString(),
+          simli_ready_at: null,
+        },
       });
-    }
-
-    if (!anamVoiceId) {
+    } catch (e) {
+      console.error('[avatar/provisionSimli] failed:', e);
       await upsertAssets(req, creator.id, {
-        metadata: { ...meta, anam_language: language, anam_status: 'processing', anam_phase: 'voice', anam_error: null },
+        metadata: { ...meta, simli_status: 'failed', simli_error: e.message },
       });
-      // Voice — clone from the recorded sample stored in Supabase (language from Studio selector).
-      if (meta.anam_voice_id && (
-        meta.anam_voice_language !== language
-        || meta.anam_voice_enhance !== voiceEnhance
-      )) {
-        try {
-          await anamDeleteVoice(meta.anam_voice_id);
-        } catch (e) {
-          console.warn('[avatar/anam] old voice delete failed:', e.message);
-        }
-      }
-      const { data: file, error: dlError } = await req.supabase.storage.from(BUCKET).download(voiceKey);
-      if (dlError || !file) throw new Error(`Could not read voice sample: ${dlError?.message || 'not found'}`);
-      const buffer = Buffer.from(await file.arrayBuffer());
-      const ext = (voiceKey.split('.').pop() || 'wav').toLowerCase();
-      const contentType = ext === 'mp3' ? 'audio/mpeg' : 'audio/wav';
-      anamVoiceId = await anamCloneVoice({
-        name: `${creator.display_name || 'Legacy'} ${creator.id.slice(0, 6)}`,
-        buffer,
-        contentType,
-        filename: `voice.${ext === 'mp3' ? 'mp3' : 'wav'}`,
-        language,
-      });
+      throw e;
     }
-
-    return upsertAssets(req, creator.id, {
-      metadata: {
-        ...meta,
-        anam_language: language,
-        anam_status: 'ready',
-        anam_error: null,
-        anam_avatar_id: anamAvatarId,
-        anam_avatar_portrait_path: portraitKey,
-        anam_avatar_model: avatarModel,
-        anam_avatar_source: 'upload',
-        anam_voice_id: anamVoiceId,
-        anam_voice_sample_path: voiceKey,
-        anam_voice_language: language,
-        anam_voice_enhance: voiceEnhance,
-        anam_provisioned_at: new Date().toISOString(),
-        anam_phase: 'live_face',
-      },
-    });
-  } catch (e) {
-    console.error('[avatar/provisionAnam] failed:', e);
-    await upsertAssets(req, creator.id, {
-      metadata: { ...meta, anam_status: 'failed', anam_error: e.message },
-    });
-    throw e;
   }
+
+  const deadline = Date.now() + (wait ? SIMLI_WAIT_MS : 0);
+  assets = await refreshSimliStatus(req, creator.id, assets);
+  while (wait && assets?.metadata?.simli_status === 'processing' && Date.now() < deadline) {
+    await new Promise((r) => setTimeout(r, SIMLI_POLL_MS));
+    assets = await refreshSimliStatus(req, creator.id, assets);
+  }
+  if (assets?.metadata?.simli_status === 'failed') {
+    throw new Error(assets.metadata.simli_error || 'Could not create your live face.');
+  }
+  return assets;
+}
+
+function liveStatus(assets) {
+  if (liveReady(assets)) return 'ready';
+  return assets?.metadata?.simli_status || 'none';
 }
 
 function buildProvisionResponse(assets, extra = {}) {
   return {
     success: true,
-    status: anamReady(assets) ? 'ready' : (assets?.metadata?.anam_status || 'none'),
+    status: liveStatus(assets),
     avatarReady: avatarReady(assets),
-    liveReady: anamReady(assets),
+    liveReady: liveReady(assets),
     assets,
     ...extra,
   };
 }
 
-function clearedAnamMetadata(meta = {}) {
+function clearedSimliMetadata(meta = {}) {
   return {
     ...meta,
-    anam_status: 'none',
-    anam_error: null,
-    anam_avatar_id: null,
-    anam_avatar_portrait_path: null,
-    anam_avatar_model: null,
-    anam_avatar_source: null,
-    anam_voice_id: null,
-    anam_voice_sample_path: null,
-    anam_voice_language: null,
-    anam_voice_enhance: null,
-    anam_provisioned_at: null,
+    simli_status: 'none',
+    simli_phase: null,
+    simli_error: null,
+    simli_face_id: null,
+    simli_face_portrait_path: null,
+    simli_started_at: null,
+    simli_ready_at: null,
   };
 }
 
-function clearedAnamVoiceMetadata(meta = {}) {
-  return {
-    ...meta,
-    anam_voice_id: null,
-    anam_voice_sample_path: null,
-    anam_voice_language: null,
-    anam_voice_enhance: null,
-    anam_status: meta.anam_avatar_id ? 'none' : (meta.anam_status || 'none'),
-    anam_error: null,
-  };
-}
-
-/** Run Anam live-avatar provisioning after the HTTP response (Vercel waitUntil). */
+/** Build the live face after the HTTP response (Vercel waitUntil); the client polls GET /assets. */
 async function runBackgroundProvision(req, creator) {
   const ctx = { supabase: req.supabase, admin: req.admin, user: req.user };
   try {
-    if (anamConfigured()) {
-      await provisionAnam(ctx, creator);
+    if (simliConfigured()) {
+      await provisionSimli(ctx, creator, { wait: true });
     }
   } catch (e) {
     console.error('[avatar/provision/bg] failed:', e);
@@ -439,7 +393,8 @@ router.get('/assets', async (req, res) => {
       creatorId = creator.id;
     }
 
-    const assets = await getAssetsForViewer(req, creatorId);
+    let assets = await getAssetsForViewer(req, creatorId);
+    assets = await refreshSimliStatus(req, creatorId, assets);
     const identity = await loadCreatorIdentity(req.supabase, creatorId);
     let urls = {};
     if (assets && !light) {
@@ -458,7 +413,8 @@ router.get('/assets', async (req, res) => {
       assets: assets || null,
       voiceCloned: assets?.metadata?.cloned === true,
       avatarReady: avatarReady(assets),
-      liveReady: anamReady(assets),
+      liveReady: liveReady(assets),
+      liveStatus: liveStatus(assets),
       hasPortrait: Boolean(assets?.portrait_path),
       previewUrl: urls.portrait || null,
       urls,
@@ -586,27 +542,9 @@ router.post('/voice-sample', async (req, res) => {
     } catch (e) {
       return res.status(e.status || 400).json({ error: e.message });
     }
-    const existing = await getAssets(req, creator.id);
-    const prevMeta = existing?.metadata || {};
-    const sampleChanged = existing?.voice_sample_path && existing.voice_sample_path !== path;
-
-    // New sample invalidates any Anam clone tied to the old recording.
-    let metadata = prevMeta;
-    if (sampleChanged || (prevMeta.anam_voice_id && prevMeta.anam_voice_sample_path !== path)) {
-      if (prevMeta.anam_voice_id) {
-        try {
-          await anamDeleteVoice(prevMeta.anam_voice_id);
-        } catch (e) {
-          console.warn('[avatar/voice-sample] stale Anam voice delete failed:', e.message);
-        }
-      }
-      metadata = clearedAnamVoiceMetadata(prevMeta);
-    }
-
     const saved = await upsertAssets(req, creator.id, {
       voice_sample_path: path,
       voice_status: 'ready',
-      metadata,
     });
 
     res.json({
@@ -619,7 +557,7 @@ router.post('/voice-sample', async (req, res) => {
   }
 });
 
-/* POST /api/avatar/voice { voiceSamplePath, language? } — clone via ElevenLabs; store Anam language for Live Call. */
+/* POST /api/avatar/voice { voiceSamplePath, language? } — clone via ElevenLabs; store the Live Call language. */
 router.post('/voice', async (req, res) => {
   try {
     const { voiceSamplePath, language } = req.body || {};
@@ -633,7 +571,7 @@ router.post('/voice', async (req, res) => {
       return res.status(503).json({ error: 'Voice cloning requires ELEVENLABS_API_KEY.' });
     }
 
-    const anamLanguage = normalizeAnamLanguage(language);
+    const liveLanguage = normalizeLiveLanguage(language);
     await upsertAssets(req, creator.id, { voice_sample_path: voiceSamplePath, voice_status: 'processing' });
 
     const { data: file, error: dlError } = await req.supabase.storage.from(BUCKET).download(voiceSamplePath);
@@ -666,18 +604,6 @@ router.post('/voice', async (req, res) => {
       await elevenLabsDeleteVoice(prevElVoiceId);
     }
 
-    // Language / sample change means the previous Anam voice clone is stale.
-    if (prevMeta.anam_voice_id && (
-      prevMeta.anam_voice_language !== anamLanguage
-      || prevMeta.anam_voice_sample_path !== voiceSamplePath
-    )) {
-      try {
-        await anamDeleteVoice(prevMeta.anam_voice_id);
-      } catch (e) {
-        console.warn('[avatar/voice] stale Anam voice delete failed:', e.message);
-      }
-    }
-
     const saved = await upsertAssets(req, creator.id, {
       voice_id: cloned.voiceId,
       voice_provider: cloned.provider,
@@ -687,13 +613,7 @@ router.post('/voice', async (req, res) => {
         cloned: true,
         voice_provider: cloned.provider,
         elevenlabs_voice_id: cloned.elevenlabsVoiceId,
-        anam_language: anamLanguage,
-        // Force Live Call re-provision with the selected language.
-        anam_voice_id: null,
-        anam_voice_sample_path: null,
-        anam_voice_language: null,
-        anam_voice_enhance: null,
-        anam_status: prevMeta.anam_avatar_id ? 'none' : (prevMeta.anam_status || 'none'),
+        live_language: liveLanguage,
       },
     });
 
@@ -889,7 +809,7 @@ async function buildAvatarContext(req, creatorId) {
 }
 
 function languageReplyHint(languageCode) {
-  const code = normalizeAnamLanguage(languageCode);
+  const code = normalizeLiveLanguage(languageCode);
   // Hard lock — matching the visitor mid-call caused caption/transcript language drift.
   const enBan =
     code === 'en'
@@ -1018,7 +938,7 @@ router.post('/ask', async (req, res) => {
     await assertCanViewArchive(req, creatorId);
 
     const assets = await getAssets(req, creatorId);
-    const languageCode = resolveAnamLanguage(assets);
+    const languageCode = resolveLiveLanguage(assets);
     const ctx = await buildAvatarContext(req, creatorId);
     const { text: answer } = await callClaude({
       system: buildAvatarSystemPrompt(ctx, languageCode),
@@ -1032,13 +952,16 @@ router.post('/ask', async (req, res) => {
   }
 });
 
-/* POST /api/avatar/live/start { creatorId? } — start a real-time Anam live call
-   using the creator's OWN face + cloned voice, grounded in their memories. Returns
-   a short-lived Anam session token for the frontend WebRTC SDK. */
+/* POST /api/avatar/live/start { creatorId? } — start a real-time call with the creator's
+   OWN face (Simli) and cloned voice (ElevenLabs), answers grounded in their memories
+   (OpenAI Realtime, text only). Returns short-lived tokens for the browser. */
 router.post('/live/start', async (req, res) => {
   try {
-    if (!anamConfigured()) {
-      return res.status(503).json({ error: 'Live calls are not configured (missing ANAM_API_KEY).' });
+    if (!simliConfigured()) {
+      return res.status(503).json({ error: 'Live calls are not configured (missing SIMLI_API_KEY).' });
+    }
+    if (!process.env.ELEVENLABS_API_KEY || !process.env.OPENAI_API_KEY) {
+      return res.status(503).json({ error: 'Live calls are not configured (missing ELEVENLABS_API_KEY or OPENAI_API_KEY).' });
     }
 
     const creatorId = await resolveTalkCreatorId(req);
@@ -1046,73 +969,43 @@ router.post('/live/start', async (req, res) => {
     await assertArchivePaid(req, creatorId);
     await assertOwnerHasMinutes(req, creatorId);
 
-    // The creator's own Anam face + cloned voice. No stock-voice fallback.
-    // Provision on demand if the owner is calling; viewers need the owner to finish Studio.
     let assets = await getAssetsForViewer(req, creatorId);
-    if (!anamReady(assets)) {
-      const owned = await getOwnedCreator(req);
-      if (owned?.id === creatorId) {
-        try {
-          assets = await provisionAnam(req, owned);
-        } catch (e) {
-          console.warn('[avatar/live/start] provision failed:', e.message);
-          return res.status(409).json({
-            error: e.message || 'Could not set up your live avatar. Finish Avatar Studio (photo + voice) and try again.',
-          });
-        }
+    assets = await refreshSimliStatus(req, creatorId, assets);
+    const owned = await getOwnedCreator(req);
+    const isOwner = owned?.id === creatorId;
+
+    if (!liveReady(assets) && isOwner && !simliFaceReady(assets) && assets?.metadata?.simli_status !== 'processing') {
+      try {
+        assets = await provisionSimli(req, owned);
+      } catch (e) {
+        console.warn('[avatar/live/start] provision failed:', e.message);
+        return res.status(409).json({
+          error: e.message || 'Could not set up your live avatar. Finish Avatar Studio (photo + voice) and try again.',
+        });
       }
     }
 
-    const avatarId = assets?.metadata?.anam_avatar_id;
-    const voiceId = assets?.metadata?.anam_voice_id;
-    if (!avatarId || !voiceId || !anamReady(assets)) {
+    const voiceId = resolveElevenLabsVoiceId(assets);
+    if (!voiceId || !voiceReady(assets)) {
       return res.status(409).json({
-        error: !voiceId || !anamVoiceReady(assets)
-          ? 'Your voice was not cloned successfully. Re-record in Avatar Studio and generate the live avatar again — Live Call will not start with a stock voice.'
+        error: isOwner
+          ? 'Your voice was not cloned successfully. Re-record in Avatar Studio — Live Call will not start with a stock voice.'
+          : 'This legacy’s cloned voice is missing. The owner should re-record it in Avatar Studio.',
+      });
+    }
+    if (!simliFaceReady(assets)) {
+      const processing = assets?.metadata?.simli_status === 'processing';
+      return res.status(409).json({
+        code: processing ? 'live_face_processing' : 'live_face_missing',
+        error: processing
+          ? 'The live face is still being created. This takes a few minutes — try again shortly.'
           : 'This legacy needs a photo and cloned voice in Avatar Studio before a live call. The owner should finish setup there.',
       });
     }
 
-    // Confirm the clone still exists on Anam — a deleted/stale id can degrade to a stock voice.
-    let verifiedVoice = null;
-    try {
-      verifiedVoice = await anamGetVoice(voiceId);
-    } catch (e) {
-      console.warn('[avatar/live/start] voice verify failed:', e.message);
-    }
-    if (!verifiedVoice?.id) {
-      const owned = await getOwnedCreator(req);
-      if (owned?.id === creatorId) {
-        await upsertAssets(req, creatorId, {
-          metadata: clearedAnamVoiceMetadata(assets.metadata || {}),
-        });
-        try {
-          assets = await provisionAnam(req, owned);
-        } catch (e) {
-          return res.status(409).json({
-            error: e.message
-              || 'Your cloned voice is missing on Anam. Re-record in Avatar Studio and generate the live avatar again — Live Call will not use a stock voice.',
-          });
-        }
-      } else {
-        return res.status(409).json({
-          error: 'This legacy’s cloned voice is missing. The owner should re-record and regenerate the live avatar in Avatar Studio.',
-        });
-      }
-    }
-
-    const readyAvatarId = assets?.metadata?.anam_avatar_id;
-    const readyVoiceId = assets?.metadata?.anam_voice_id;
-    const ownVoice = Boolean(readyVoiceId && anamVoiceReady(assets) && anamReady(assets));
-    if (!readyAvatarId || !ownVoice) {
-      return res.status(409).json({
-        error: 'Live Call requires your own cloned voice. Re-record in Avatar Studio and generate the live avatar again — stock voice is disabled.',
-      });
-    }
-
-    const languageCode = resolveAnamLanguage(assets);
+    const languageCode = resolveLiveLanguage(assets);
     const ctx = await buildAvatarContext(req, creatorId);
-    // Leaner prompt + short replies for live video (long turns freeze lip-sync + dump captions).
+    // Lean prompt + short replies for live video (long turns lag the face and flood captions).
     const systemPrompt = buildAvatarSystemPrompt(ctx, languageCode, {
       liveMode: true,
       maxMemories: 8,
@@ -1120,46 +1013,64 @@ router.post('/live/start', async (req, res) => {
       maxValues: 8,
       maxWisdom: 6,
     });
+    const greeting = `Hello. It's me — ${ctx.name}. I'm right here.`;
+    const instructions = `${systemPrompt}
 
-    let sessionToken;
-    try {
-      sessionToken = await anamCreateSessionToken({
-        name: ctx.name,
-        avatarId: readyAvatarId,
-        voiceId: readyVoiceId,
-        languageCode,
-        systemPrompt,
-        initialMessage: `Hello. It's me — ${ctx.name}. I'm right here.`,
-      });
-    } catch (e) {
-      const msg = String(e.message || '');
-      if (/voice/i.test(msg) || e.status === 400 || e.status === 404) {
-        await upsertAssets(req, creatorId, {
-          metadata: {
-            ...clearedAnamVoiceMetadata(assets.metadata || {}),
-            anam_status: 'failed',
-            anam_error: 'Cloned voice rejected by Anam — re-record and regenerate.',
-          },
-        });
-        return res.status(409).json({
-          error: 'Your cloned voice could not start a Live Call. Re-record in Avatar Studio and generate the live avatar again — we will not fall back to a stock voice.',
-        });
-      }
-      throw e;
-    }
+CALL OPENING: When the call starts you will be asked to greet them. Say this greeting (in "${languageCode}", translated naturally if needed) and nothing else: "${greeting}"`;
+
+    const [simliToken, realtimeToken] = await Promise.all([
+      simliCreateSessionToken({ faceId: assets.metadata.simli_face_id }),
+      createLiveRealtimeSecret({ instructions, languageCode }),
+    ]);
 
     res.json({
-      sessionToken,
-      usingOwnFace: Boolean(readyAvatarId),
-      usingOwnVoice: ownVoice,
+      simliToken,
+      realtimeToken,
+      speechTicket: signSpeechTicket({ userId: req.user.id, creatorId, voiceId, languageCode }),
+      usingOwnFace: true,
+      usingOwnVoice: true,
       languageCode,
       creatorId,
-      videoProfile: anamBuildSessionOptions(),
     });
   } catch (e) {
     if (e?.status === 402) return sendAvatarError(res, e);
     console.error('[avatar/live/start] failed:', e);
     res.status(502).json({ error: e.message });
+  }
+});
+
+/* POST /api/avatar/live/speech { ticket, text } — one sentence in the cloned voice,
+   streamed as raw PCM16 16 kHz mono for Simli. Stops (and stops billing) if the caller aborts. */
+router.post('/live/speech', async (req, res) => {
+  const grant = verifySpeechTicket(req.body?.ticket, req.user?.id);
+  if (!grant) return res.status(401).json({ error: 'This live call has expired. Start the call again.' });
+  const text = String(req.body?.text || '').trim().slice(0, 600);
+  if (!text) return res.status(400).json({ error: 'text required' });
+
+  const upstreamAbort = new AbortController();
+  res.on('close', () => {
+    if (!res.writableFinished) upstreamAbort.abort();
+  });
+
+  try {
+    const body = await streamSpeechPcm16k({
+      voiceId: grant.voiceId,
+      text,
+      languageCode: grant.languageCode,
+      signal: upstreamAbort.signal,
+    });
+    res.setHeader('Content-Type', 'audio/pcm;rate=16000;channels=1');
+    res.setHeader('Cache-Control', 'no-store');
+    res.setHeader('X-Accel-Buffering', 'no');
+    res.flushHeaders?.();
+    const nodeStream = Readable.fromWeb(body);
+    nodeStream.on('error', () => res.end());
+    nodeStream.pipe(res);
+  } catch (e) {
+    if (upstreamAbort.signal.aborted) return;
+    console.error('[avatar/live/speech] failed:', e.message);
+    if (!res.headersSent) res.status(502).json({ error: 'Could not voice this reply.' });
+    else res.end();
   }
 });
 
@@ -1199,17 +1110,17 @@ router.post('/say', async (req, res) => {
     if (upErr) throw new Error(`Could not store voice audio: ${upErr.message}`);
     const playbackUrl = await signed(req, audioPath);
 
-    const liveReady = anamReady(assets);
+    const canCall = liveReady(assets);
     res.json({
       videoId: null,
       audioUrl: playbackUrl,
       audioOnly: true,
-      notice: liveReady
+      notice: canCall
         ? 'Playing in your voice. Use Live Call for real-time face and voice.'
         : 'Playing in your voice. Finish Avatar Studio to enable Live Call.',
       voiceCloned: true,
       avatarReady: avatarReady(assets),
-      liveReady,
+      liveReady: canCall,
     });
   } catch (e) {
     console.error('[avatar/say] failed:', e);
@@ -1220,7 +1131,7 @@ router.post('/say', async (req, res) => {
 /* GET /api/avatar/greeting-text — the fixed greeting used for the studio preview. */
 router.get('/greeting-text', (_req, res) => res.json({ text: AVATAR_GREETING }));
 
-/* DELETE /api/avatar/live — remove Anam live avatar + voice; keeps portrait/voice sample for re-provision. */
+/* DELETE /api/avatar/live — remove the Simli live face; keeps portrait/voice for re-provision. */
 router.delete('/live', async (req, res) => {
   try {
     const creator = await getOwnedCreator(req);
@@ -1230,25 +1141,16 @@ router.delete('/live', async (req, res) => {
     const meta = assets?.metadata || {};
     const warnings = [];
 
-    if (anamConfigured()) {
-      if (meta.anam_avatar_id) {
-        try {
-          await anamDeleteAvatar(meta.anam_avatar_id);
-        } catch (e) {
-          warnings.push(`Anam avatar: ${e.message}`);
-        }
-      }
-      if (meta.anam_voice_id) {
-        try {
-          await anamDeleteVoice(meta.anam_voice_id);
-        } catch (e) {
-          warnings.push(`Anam voice: ${e.message}`);
-        }
+    if (simliConfigured() && meta.simli_face_id) {
+      try {
+        await simliDeleteFace(meta.simli_face_id);
+      } catch (e) {
+        warnings.push(`Simli face: ${e.message}`);
       }
     }
 
     const saved = assets
-      ? await upsertAssets(req, creator.id, { metadata: clearedAnamMetadata(meta) })
+      ? await upsertAssets(req, creator.id, { metadata: clearedSimliMetadata(meta) })
       : null;
 
     res.json({
@@ -1265,8 +1167,8 @@ router.delete('/live', async (req, res) => {
   }
 });
 
-/* POST /api/avatar/provision — set up the Anam live avatar from photo + voice.
-   On Vercel, Anam runs in the background — client polls GET /assets until liveReady. */
+/* POST /api/avatar/provision — build the Simli live face from the portrait.
+   Generation takes a few minutes; it runs in the background and the client polls GET /assets. */
 router.post('/provision', async (req, res) => {
   try {
     const creator = await getOwnedCreator(req);
@@ -1274,17 +1176,9 @@ router.post('/provision', async (req, res) => {
     await assertCanViewArchive(req, creator.id);
 
     let assets = await getAssets(req, creator.id);
-    if (anamReady(assets)) {
+    assets = await refreshSimliStatus(req, creator.id, assets);
+    if (liveReady(assets)) {
       return res.json(buildProvisionResponse(assets));
-    }
-
-    const meta = assets?.metadata || {};
-    if (meta.anam_status === 'processing') {
-      return res.status(202).json(buildProvisionResponse(assets || { metadata: meta }, {
-        status: 'processing',
-        liveReady: false,
-        message: 'Creating your live avatar. This usually takes about a minute.',
-      }));
     }
 
     if (!assets?.portrait_path || !assets?.voice_sample_path) {
@@ -1293,25 +1187,43 @@ router.post('/provision', async (req, res) => {
       });
     }
 
-    if (!anamConfigured()) {
-      return res.status(503).json({ error: 'Live calls require ANAM_API_KEY.' });
+    if (!simliConfigured()) {
+      return res.status(503).json({ error: 'Live calls require SIMLI_API_KEY.' });
     }
 
-    await upsertAssets(req, creator.id, {
-      metadata: { ...meta, anam_status: 'processing', anam_error: null },
-    });
+    let meta = assets.metadata || {};
+    const startedAt = Date.parse(meta.simli_started_at || '') || 0;
+    const faceStillGenerating = meta.simli_status === 'processing' && (
+      (meta.simli_face_id && meta.simli_face_portrait_path === assets.portrait_path)
+      || (!meta.simli_face_id && Date.now() - startedAt < 3 * 60 * 1000)
+    );
+    if (faceStillGenerating && !meta.simli_face_id) {
+      return res.status(202).json(buildProvisionResponse(assets, {
+        status: 'processing',
+        liveReady: false,
+        message: 'Creating your live face. This usually takes a few minutes.',
+      }));
+    }
+    if (!faceStillGenerating && !simliFaceReady(assets)) {
+      meta = {
+        ...clearedSimliMetadata(meta),
+        simli_status: 'processing',
+        simli_phase: 'photo',
+        simli_started_at: new Date().toISOString(),
+      };
+      assets = await upsertAssets(req, creator.id, { metadata: meta });
+    }
 
+    const processingMessage = 'Creating your live face. This usually takes a few minutes.';
     const onVercel = Boolean(process.env.VERCEL);
     if (onVercel) {
       const { waitUntil } = await import('@vercel/functions');
       waitUntil(runBackgroundProvision(req, creator));
-      return res.status(202).json({
-        success: true,
+      return res.status(202).json(buildProvisionResponse(assets, {
         status: 'processing',
         liveReady: false,
-        avatarReady: avatarReady(assets),
-        message: 'Creating your live avatar. This usually takes about a minute.',
-      });
+        message: processingMessage,
+      }));
     }
 
     await runBackgroundProvision(req, creator);
@@ -1336,21 +1248,17 @@ router.put('/assets', async (req, res) => {
     const patch = {};
     if (portraitPath !== undefined) {
       patch.portrait_path = portraitPath;
-      // New photo — clear Anam so the next provision rebuilds the live face.
+      // New photo — drop the old live face so the next provision rebuilds it.
       if (portraitPath !== existing?.portrait_path) {
-        const oldAnamId = existing?.metadata?.anam_avatar_id;
-        if (oldAnamId && anamConfigured()) {
-          anamDeleteAvatar(oldAnamId).catch((e) =>
-            console.warn('[avatar/assets] anam avatar delete:', e.message),
+        const oldFaceId = existing?.metadata?.simli_face_id;
+        if (oldFaceId && simliConfigured()) {
+          simliDeleteFace(oldFaceId).catch((e) =>
+            console.warn('[avatar/assets] simli face delete:', e.message),
           );
         }
         patch.metadata = {
-          ...(existing?.metadata || {}),
+          ...clearedSimliMetadata(existing?.metadata || {}),
           portrait_layout: PORTRAIT_LAYOUT_FULLBLEED,
-          anam_status: 'none',
-          anam_avatar_id: null,
-          anam_avatar_portrait_path: null,
-          anam_avatar_source: null,
         };
       }
     }

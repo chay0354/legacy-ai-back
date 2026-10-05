@@ -306,7 +306,7 @@ ${freeTalk
 ${openGuidance}`;
 }
 
-function realtimeNumberEnv(name, fallback) {
+export function realtimeNumberEnv(name, fallback) {
   const raw = process.env[name];
   if (raw == null || raw === '') return fallback;
   const n = Number(raw);

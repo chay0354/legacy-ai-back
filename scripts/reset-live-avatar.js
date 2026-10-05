@@ -1,23 +1,27 @@
 /**
- * Remove Anam live avatar + voice for a creator and reset DB so provision can run again.
- * Usage: node scripts/reset-live-avatar.js [creatorId]
+ * Remove the Simli live face for a creator and reset DB so provision can run again.
+ * Usage: node scripts/reset-live-avatar.js <creatorId>
  */
 import 'dotenv/config';
 import { createClient } from '@supabase/supabase-js';
-import { deleteAvatar as anamDeleteAvatar, deleteVoice as anamDeleteVoice } from '../src/services/anam.js';
+import { deleteFace as simliDeleteFace } from '../src/services/simli.js';
 
-const creatorId = process.argv[2] || 'b7c7bc8b-19b7-4de9-a56b-39c0c438a0fc';
+const creatorId = process.argv[2];
+if (!creatorId) {
+  console.error('Usage: node scripts/reset-live-avatar.js <creatorId>');
+  process.exit(1);
+}
 
-function clearedAnamMetadata(meta = {}) {
+function clearedSimliMetadata(meta = {}) {
   return {
     ...meta,
-    anam_status: 'none',
-    anam_error: null,
-    anam_avatar_id: null,
-    anam_avatar_portrait_path: null,
-    anam_voice_id: null,
-    anam_voice_sample_path: null,
-    anam_provisioned_at: null,
+    simli_status: 'none',
+    simli_phase: null,
+    simli_error: null,
+    simli_face_id: null,
+    simli_face_portrait_path: null,
+    simli_started_at: null,
+    simli_ready_at: null,
   };
 }
 
@@ -42,25 +46,20 @@ if (!row) {
 }
 
 const meta = row.metadata || {};
-const anamAvatarId = meta.anam_avatar_id;
-const anamVoiceId = meta.anam_voice_id;
-
-if (anamAvatarId && process.env.ANAM_API_KEY) {
+if (meta.simli_face_id && process.env.SIMLI_API_KEY) {
   try {
-    await anamDeleteAvatar(anamAvatarId);
-    console.log(`Anam avatar deleted ${anamAvatarId}`);
+    await simliDeleteFace(meta.simli_face_id);
+    console.log(`Simli face deleted ${meta.simli_face_id}`);
   } catch (e) {
-    console.warn(`Anam avatar: ${e.message}`);
+    console.warn(`Simli face: ${e.message}`);
   }
 }
 
-await anamDeleteVoice(anamVoiceId);
-
 const { error: upErr } = await admin
   .from('legacy_avatar_assets')
-  .update({ metadata: clearedAnamMetadata(meta) })
+  .update({ metadata: clearedSimliMetadata(meta) })
   .eq('creator_id', creatorId);
 
 if (upErr) throw upErr;
 
-console.log(`Live avatar cleared for creator ${creatorId}. Portrait + voice sample kept — run provision to create a new one.`);
+console.log(`Live face cleared for creator ${creatorId}. Portrait + voice kept — run provision to create a new one.`);

@@ -1,9 +1,8 @@
 /**
- * Languages Anam documents for multilingual / voice flows.
- * Source: https://docs.anam.ai/personas/voices/multilingual
- * Keep in sync with front/src/lib/anamLanguages.ts
+ * Languages offered for Live Call (OpenAI listens + answers, ElevenLabs speaks).
+ * Keep in sync with front/src/lib/liveLanguages.ts
  */
-export const ANAM_LANGUAGES = [
+export const LIVE_LANGUAGES = [
   { code: 'en', label: 'English' },
   { code: 'he', label: 'Hebrew' },
   { code: 'ar', label: 'Arabic' },
@@ -63,10 +62,10 @@ export const ANAM_LANGUAGES = [
   { code: 'cy', label: 'Welsh' },
 ];
 
-const CODE_SET = new Set(ANAM_LANGUAGES.map((l) => l.code));
+const CODE_SET = new Set(LIVE_LANGUAGES.map((l) => l.code));
 
-/** Returns a supported Anam language code, defaulting to English. */
-export function normalizeAnamLanguage(code) {
+/** Returns a supported Live Call language code, defaulting to English. */
+export function normalizeLiveLanguage(code) {
   const raw = String(code || '').trim().toLowerCase();
   if (!raw) return 'en';
   const base = raw.split(/[-_]/)[0];
@@ -75,7 +74,7 @@ export function normalizeAnamLanguage(code) {
   return 'en';
 }
 
-export function isAnamLanguage(code) {
+export function isLiveLanguage(code) {
   const raw = String(code || '').trim().toLowerCase();
   return CODE_SET.has(raw) || CODE_SET.has(raw.split(/[-_]/)[0]);
 }

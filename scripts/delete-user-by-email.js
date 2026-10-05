@@ -3,11 +3,11 @@
  * Usage: node scripts/delete-user-by-email.js <email>
  *
  * Requires SUPABASE_URL + SUPABASE_SECRET_KEY in .env
- * Also best-effort deletes Anam/ElevenLabs clones from avatar metadata.
+ * Also best-effort deletes the Simli face and ElevenLabs clone from avatar metadata.
  */
 import 'dotenv/config';
 import { createClient } from '@supabase/supabase-js';
-import { deleteAvatar as anamDeleteAvatar, deleteVoice as anamDeleteVoice } from '../src/services/anam.js';
+import { deleteFace as simliDeleteFace } from '../src/services/simli.js';
 import { deleteVoice as elevenLabsDeleteVoice } from '../src/services/elevenlabs.js';
 
 const email = (process.argv[2] || '').trim().toLowerCase();
@@ -35,20 +35,12 @@ async function wipeExternal(meta = {}, voiceId, voiceProvider) {
       console.warn('ElevenLabs:', e.message);
     }
   }
-  if (meta.anam_avatar_id && process.env.ANAM_API_KEY) {
+  if (meta.simli_face_id && process.env.SIMLI_API_KEY) {
     try {
-      await anamDeleteAvatar(meta.anam_avatar_id);
-      console.log('Anam avatar deleted', meta.anam_avatar_id);
+      await simliDeleteFace(meta.simli_face_id);
+      console.log('Simli face deleted', meta.simli_face_id);
     } catch (e) {
-      console.warn('Anam avatar:', e.message);
-    }
-  }
-  if (meta.anam_voice_id && process.env.ANAM_API_KEY) {
-    try {
-      await anamDeleteVoice(meta.anam_voice_id);
-      console.log('Anam voice deleted', meta.anam_voice_id);
-    } catch (e) {
-      console.warn('Anam voice:', e.message);
+      console.warn('Simli face:', e.message);
     }
   }
 }

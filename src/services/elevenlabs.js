@@ -127,6 +127,72 @@ export async function textToSpeech({ voiceId, text, modelId, voiceSettings }) {
   return Buffer.from(arrayBuffer);
 }
 
+const LIVE_FALLBACK_MODEL = 'eleven_v3_conversational';
+let modelLanguages = null;
+let modelLanguagesAt = 0;
+
+async function languagesByModel() {
+  if (modelLanguages && Date.now() - modelLanguagesAt < SUBSCRIPTION_TTL_MS * 12) return modelLanguages;
+  const res = await fetch(`${BASE_URL}/models`, { headers: { 'xi-api-key': apiKey() } });
+  if (!res.ok) return modelLanguages || new Map();
+  const models = await res.json();
+  modelLanguages = new Map(
+    (Array.isArray(models) ? models : []).map((m) => [
+      m.model_id,
+      new Set((m.languages || []).map((l) => l.language_id)),
+    ]),
+  );
+  modelLanguagesAt = Date.now();
+  return modelLanguages;
+}
+
+/** Fast live model, unless it cannot speak this language (Flash has no Hebrew). */
+export async function liveModelFor(languageCode) {
+  const preferred = process.env.ELEVENLABS_LIVE_MODEL || 'eleven_flash_v2_5';
+  const code = String(languageCode || 'en').toLowerCase();
+  try {
+    const byModel = await languagesByModel();
+    if (byModel.get(preferred)?.has(code)) return { modelId: preferred, languageCode: code };
+    if (byModel.get(LIVE_FALLBACK_MODEL)?.has(code)) return { modelId: LIVE_FALLBACK_MODEL, languageCode: code };
+  } catch {
+    /* fall through to the preferred model without a language hint */
+  }
+  return { modelId: preferred, languageCode: null };
+}
+
+/**
+ * Stream speech in the cloned voice as raw 16 kHz mono PCM16 — the format Simli lip-syncs to.
+ * Returns the upstream web ReadableStream; abort `signal` to stop billing mid-sentence.
+ */
+export async function streamSpeechPcm16k({ voiceId, text, languageCode, signal }) {
+  const { modelId, languageCode: hint } = await liveModelFor(languageCode);
+  const body = {
+    text,
+    model_id: modelId,
+    voice_settings: elevenLabsVoiceSettings(),
+  };
+  if (hint) body.language_code = hint;
+
+  const res = await fetch(
+    `${BASE_URL}/text-to-speech/${encodeURIComponent(voiceId)}/stream?output_format=pcm_16000`,
+    {
+      method: 'POST',
+      headers: {
+        'xi-api-key': apiKey(),
+        'content-type': 'application/json',
+        accept: 'audio/pcm',
+      },
+      body: JSON.stringify(body),
+      signal,
+    },
+  );
+  if (!res.ok || !res.body) {
+    const err = await res.text().catch(() => '');
+    throw new Error(`ElevenLabs stream error ${res.status}: ${err}`);
+  }
+  return res.body;
+}
+
 /** Remove a cloned voice (cleanup when re-recording). */
 export async function deleteVoice(voiceId) {
   if (!voiceId) return;

@@ -1,5 +1,5 @@
 /**
- * Remove every avatar in Legacy AI: external clones (Anam, ElevenLabs, HeyGen) + DB rows + storage.
+ * Remove every avatar in Legacy AI: external clones (Simli, ElevenLabs, HeyGen) + DB rows + storage.
  * Usage: node scripts/wipe-all-avatars.js
  *
  * Requires SUPABASE_URL + SUPABASE_SECRET_KEY in .env (or env vars).
@@ -7,7 +7,7 @@
  */
 import 'dotenv/config';
 import { createClient } from '@supabase/supabase-js';
-import { listAvatars as anamListAvatars, deleteAvatar as anamDeleteAvatar, deleteVoice as anamDeleteVoice } from '../src/services/anam.js';
+import { deleteFace as simliDeleteFace } from '../src/services/simli.js';
 import { deleteVoice as elevenLabsDeleteVoice } from '../src/services/elevenlabs.js';
 
 const HEYGEN_BASE = 'https://api.heygen.com/v3';
@@ -59,43 +59,13 @@ async function wipeExternalForRow(row) {
   if (heygenVoiceId) await heygenDelete(`/voices/${encodeURIComponent(heygenVoiceId)}`);
   if (md.heygen_photo_avatar_id) await heygenDelete(`/photo_avatar/${md.heygen_photo_avatar_id}`);
 
-  if (md.anam_avatar_id && process.env.ANAM_API_KEY) {
+  if (md.simli_face_id && process.env.SIMLI_API_KEY) {
     try {
-      await anamDeleteAvatar(md.anam_avatar_id);
-      console.log(`Anam avatar deleted ${md.anam_avatar_id}`);
+      await simliDeleteFace(md.simli_face_id);
+      console.log(`Simli face deleted ${md.simli_face_id}`);
     } catch (e) {
-      console.warn(`Anam avatar ${md.anam_avatar_id}: ${e.message}`);
+      console.warn(`Simli face ${md.simli_face_id}: ${e.message}`);
     }
-  }
-
-  if (md.anam_voice_id && process.env.ANAM_API_KEY) {
-    try {
-      await anamDeleteVoice(md.anam_voice_id);
-      console.log(`Anam voice deleted ${md.anam_voice_id}`);
-    } catch (e) {
-      console.warn(`Anam voice ${md.anam_voice_id}: ${e.message}`);
-    }
-  }
-}
-
-/** Delete custom Anam one-shots (display names tied to creator ids). */
-async function wipeStaleAnamAvatars() {
-  if (!process.env.ANAM_API_KEY) return;
-  try {
-    const avatars = await anamListAvatars();
-    for (const a of avatars) {
-      const name = a.displayName || '';
-      const isCustom = a.type === 'custom' || a.isCustom || /[0-9a-f]{6}$/i.test(name) || name.includes('Legacy');
-      if (!isCustom) continue;
-      try {
-        await anamDeleteAvatar(a.id);
-        console.log(`Anam stale avatar deleted ${a.id} (${name})`);
-      } catch (e) {
-        console.warn(`Anam stale ${a.id}: ${e.message}`);
-      }
-    }
-  } catch (e) {
-    console.warn(`Anam list avatars: ${e.message}`);
   }
 }
 
@@ -141,8 +111,6 @@ for (const row of rows || []) {
   console.log(`Wiping external clones for creator ${row.creator_id}...`);
   await wipeExternalForRow(row);
 }
-
-await wipeStaleAnamAvatars();
 
 const { error: delRowsErr } = await admin.from('legacy_avatar_assets').delete().neq('creator_id', '00000000-0000-0000-0000-000000000000');
 if (delRowsErr) throw delRowsErr;
