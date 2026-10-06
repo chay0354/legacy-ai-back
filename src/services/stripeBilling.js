@@ -1,7 +1,8 @@
 import Stripe from 'stripe';
 import {
   addonOffer, getPlan, isAddonPlan, isPaidStatus, planCanInterview, planCanViewArchive,
-  planCountsAsSetup, planIdFromPriceId, planUsesMinutes, priceIdForPlan, setResolvedPrice,
+  clearPriceIdOverride, planCountsAsSetup, planIdFromPriceId, planUsesMinutes, priceEnvName,
+  priceIdForPlan, setResolvedPrice,
 } from './plans.js';
 import {
   getBillingByCustomerId, getBillingByUserId, ownerUserIdForCreator, upsertBilling,
@@ -17,19 +18,42 @@ export function stripeConfigured() {
   return Boolean(process.env.STRIPE_SECRET_KEY);
 }
 
-/** Env first; if production never got the new price IDs, find them on the Stripe product. */
+function stripeResourceMissing(err) {
+  return err?.code === 'resource_missing' || /no such (customer|price|subscription)/i.test(err?.message || '');
+}
+
+/** A stored price from the previous Stripe account is skipped. The current account's price is used. */
 export async function resolvePriceId(planId) {
-  const fromEnv = priceIdForPlan(planId);
-  if (fromEnv) return fromEnv;
-  if (!process.env.STRIPE_SECRET_KEY || !getPlan(planId)) return '';
+  const plan = getPlan(planId);
+  if (!plan || !stripeConfigured()) return priceIdForPlan(planId);
+  const stripe = stripeClient();
+  const candidates = [
+    priceIdForPlan(planId),
+    process.env[priceEnvName(planId)] || '',
+  ];
+  const seen = new Set();
+  for (const priceId of candidates) {
+    if (!priceId || seen.has(priceId)) continue;
+    seen.add(priceId);
+    try {
+      const price = await stripe.prices.retrieve(priceId);
+      if (price && !price.deleted) {
+        setResolvedPrice(planId, price.id);
+        return price.id;
+      }
+    } catch (err) {
+      if (!stripeResourceMissing(err)) throw err;
+      console.warn('[billing] price is not on this Stripe account:', planId);
+      clearPriceIdOverride(planId);
+    }
+  }
   try {
-    const plan = getPlan(planId);
-    const products = await stripeClient().products.search({
+    const products = await stripe.products.search({
       query: `metadata['legacy_plan']:'${planId}' AND active:'true'`,
     });
     const product = products.data[0];
     if (!product) return '';
-    const prices = await stripeClient().prices.list({ product: product.id, active: true, limit: 20 });
+    const prices = await stripe.prices.list({ product: product.id, active: true, limit: 20 });
     const match = prices.data.find((p) =>
       p.unit_amount === plan.amount
       && p.currency === plan.currency
@@ -42,6 +66,19 @@ export async function resolvePriceId(planId) {
     console.warn('[billing] could not resolve Stripe price for', planId, e.message);
     return '';
   }
+}
+
+/** Stored customers from the previous Stripe account are not reused. */
+export async function customerOnThisAccount(customerId) {
+  if (!customerId || !stripeConfigured()) return null;
+  try {
+    const customer = await stripeClient().customers.retrieve(customerId);
+    if (customer && !customer.deleted) return customerId;
+  } catch (err) {
+    if (!stripeResourceMissing(err)) throw err;
+    console.warn('[billing] customer is not on this Stripe account');
+  }
+  return null;
 }
 
 /** Refuse checkout when the Stripe Price amount or interval is not the price we list. */

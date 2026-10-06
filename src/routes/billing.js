@@ -9,6 +9,7 @@ import {
   applySubscriptionEvent,
   assertListedPrice,
   billingForUser,
+  customerOnThisAccount,
   hasCompletedSetup,
   listBillingHistory,
   liveSubscriptionForCustomer,
@@ -138,7 +139,7 @@ router.post('/checkout', async (req, res) => {
         });
       }
     }
-    let customerId = existing?.stripeCustomerId || null;
+    let customerId = await customerOnThisAccount(existing?.stripeCustomerId);
 
     if (!customerId) {
       const customer = await stripe.customers.create({

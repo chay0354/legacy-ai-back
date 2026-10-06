@@ -163,6 +163,12 @@ export function setPriceOverride(planId, amountCents, stripePriceId) {
   };
 }
 
+/** Drop a stored Stripe price id that belongs to a previous account. The listed amount stays. */
+export function clearPriceIdOverride(planId) {
+  if (!priceOverrides[planId]) return;
+  priceOverrides[planId] = { ...priceOverrides[planId], stripePriceId: '' };
+}
+
 export function getPlan(id) {
   const base = PLANS[id];
   if (!base) return null;
