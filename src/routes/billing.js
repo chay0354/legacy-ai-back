@@ -30,6 +30,7 @@ function frontendBase(req) {
   const origin = String(req.headers.origin || '').replace(/\/$/, '');
   if (origin && /^https?:\/\/(localhost|127\.0\.0\.1)(:\d+)?$/.test(origin)) return origin;
   if (origin && /^https:\/\/[\w.-]+\.vercel\.app$/.test(origin)) return origin;
+  if (origin && /^https:\/\/(www\.)?astold\.ai$/.test(origin)) return origin;
   return String(process.env.FRONTEND_URL || 'https://legacy-ai-front.vercel.app').replace(/\/$/, '');
 }
 

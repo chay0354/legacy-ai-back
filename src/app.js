@@ -20,6 +20,8 @@ function corsOrigins() {
     'http://localhost:5173',
     'http://localhost:3000',
     'https://legacy-ai-front.vercel.app',
+    'https://astold.ai',
+    'https://www.astold.ai',
   ]);
 
   for (const raw of [process.env.FRONTEND_URL, process.env.VERCEL_URL, process.env.VERCEL_BRANCH_URL]) {
