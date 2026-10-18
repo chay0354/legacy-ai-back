@@ -96,11 +96,37 @@ router.post('/sign-up', async (req, res) => {
   }
 });
 
+const RESET_HOSTS = new Set([
+  'www.astold.ai',
+  'astold.ai',
+  'legacy-ai-front.vercel.app',
+  'localhost',
+  '127.0.0.1',
+]);
+
+/** Only send people back to our own reset page. */
+function resetRedirect(requested) {
+  const fallbackBase = String(process.env.FRONTEND_URL || 'https://www.astold.ai').replace(/\/$/, '');
+  const fallback = `${fallbackBase}/reset-password`;
+  try {
+    const url = new URL(String(requested || fallback));
+    const local = url.hostname === 'localhost' || url.hostname === '127.0.0.1';
+    if (!RESET_HOSTS.has(url.hostname)) return fallback;
+    if (url.protocol !== 'https:' && !local) return fallback;
+    url.pathname = '/reset-password';
+    url.search = '';
+    url.hash = '';
+    return url.toString();
+  } catch {
+    return fallback;
+  }
+}
+
 /** POST /api/auth/forgot-password */
 router.post('/forgot-password', async (req, res) => {
   try {
     const email = String(req.body.email || '').trim();
-    const redirectTo = String(req.body.redirectTo || process.env.FRONTEND_URL || 'http://localhost:5173');
+    const redirectTo = resetRedirect(req.body.redirectTo);
     if (!email) return res.status(400).json({ error: 'Email is required' });
 
     const supabase = authClient();

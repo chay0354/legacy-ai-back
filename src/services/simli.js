@@ -158,6 +158,27 @@ function numberEnv(name, fallback) {
   return Number.isFinite(n) && n > 0 ? n : fallback;
 }
 
+/** Temporary ICE servers so the browser can open the face over a direct WebRTC connection. */
+export async function iceServers() {
+  try {
+    const res = await fetch(`${BASE_URL}/compose/ice`, {
+      headers: { 'x-simli-api-key': apiKey(), Accept: 'application/json' },
+    });
+    if (!res.ok) return [];
+    const data = await res.json();
+    if (!Array.isArray(data)) return [];
+    return data
+      .filter((server) => server && (server.urls || server.url))
+      .map((server) => ({
+        urls: server.urls || server.url,
+        ...(server.username ? { username: server.username } : {}),
+        ...(server.credential ? { credential: server.credential } : {}),
+      }));
+  } catch {
+    return [];
+  }
+}
+
 /** Short-lived token the browser uses to open the face stream. Nobody sees the API key. */
 export async function createSessionToken({ faceId }) {
   if (!faceId) throw new Error('Live Call requires a Simli face id.');

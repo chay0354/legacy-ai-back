@@ -10,6 +10,7 @@ import {
   faceStatus as simliFaceStatus,
   deleteFace as simliDeleteFace,
   createSessionToken as simliCreateSessionToken,
+  iceServers as simliIceServers,
 } from '../services/simli.js';
 import { createLiveRealtimeSecret, signSpeechTicket, verifySpeechTicket } from '../services/liveCall.js';
 import { makeAccessStore } from '../db/accessRepo.js';
@@ -1018,14 +1019,16 @@ router.post('/live/start', async (req, res) => {
 
 CALL OPENING: When the call starts you will be asked to greet them. Say this greeting (in "${languageCode}", translated naturally if needed) and nothing else: "${greeting}"`;
 
-    const [simliToken, realtimeToken] = await Promise.all([
+    const [simliToken, realtimeToken, iceServers] = await Promise.all([
       simliCreateSessionToken({ faceId: assets.metadata.simli_face_id }),
       createLiveRealtimeSecret({ instructions, languageCode }),
+      simliIceServers(),
     ]);
 
     res.json({
       simliToken,
       realtimeToken,
+      iceServers,
       speechTicket: signSpeechTicket({ userId: req.user.id, creatorId, voiceId, languageCode }),
       usingOwnFace: true,
       usingOwnVoice: true,
@@ -1071,6 +1074,46 @@ router.post('/live/speech', async (req, res) => {
     console.error('[avatar/live/speech] failed:', e.message);
     if (!res.headersSent) res.status(502).json({ error: 'Could not voice this reply.' });
     else res.end();
+  }
+});
+
+/* POST /api/avatar/live/reply { ticket, text, history? }
+   Used when OpenAI Realtime has no credits. Claude writes the spoken line;
+   the browser still plays it through the cloned voice and the live face. */
+router.post('/live/reply', async (req, res) => {
+  const grant = verifySpeechTicket(req.body?.ticket, req.user?.id);
+  if (!grant) return res.status(401).json({ error: 'This live call has expired. Start the call again.' });
+  const text = String(req.body?.text || '').trim().slice(0, 800);
+  if (!text) return res.status(400).json({ error: 'text required' });
+  if (!process.env.ANTHROPIC_API_KEY) {
+    return res.status(503).json({ error: 'Conversation is not configured (missing ANTHROPIC_API_KEY).' });
+  }
+
+  const history = Array.isArray(req.body?.history) ? req.body.history.slice(-8) : [];
+  const lines = history
+    .filter((turn) => turn && (turn.role === 'user' || turn.role === 'assistant') && turn.text)
+    .map((turn) => `${turn.role === 'user' ? 'Visitor' : 'You'}: ${String(turn.text).trim().slice(0, 400)}`)
+    .join('\n');
+
+  try {
+    const assets = await getAssetsForViewer(req, grant.creatorId);
+    const languageCode = grant.languageCode || resolveLiveLanguage(assets);
+    const ctx = await buildAvatarContext(req, grant.creatorId);
+    const system = `${buildAvatarSystemPrompt(ctx, languageCode, {
+      liveMode: true,
+      maxMemories: 8,
+      maxRelationships: 8,
+      maxValues: 8,
+      maxWisdom: 6,
+    })}
+
+This is a live video call. Answer in one or two short spoken sentences. No lists, no stage directions.`;
+    const userMessage = `${lines ? `${lines}\n` : ''}Visitor: ${text}`;
+    const { text: answer } = await callClaude({ system, userMessage, maxTokens: 180 });
+    res.json({ text: String(answer || '').trim() });
+  } catch (e) {
+    console.error('[avatar/live/reply] failed:', e.message);
+    if (!res.headersSent) sendAvatarError(res, e);
   }
 });
 
