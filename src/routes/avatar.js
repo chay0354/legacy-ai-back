@@ -220,7 +220,7 @@ async function readPortraitForFace(req, assets) {
 
   // Simli frames the head itself for best lip-sync; fall back to our photo if that step fails.
   // Trinity-only framing. The current Simli plan uses the legacy face model.
-  if (process.env.SIMLI_FACE_MODEL === 'trinity' && process.env.SIMLI_PREPROCESS !== 'off') {
+  if (process.env.SIMLI_FACE_MODEL !== 'legacy' && process.env.SIMLI_PREPROCESS !== 'off') {
     try {
       const framed = await simliPreprocessPortrait({ buffer, contentType, filename });
       if (framed?.length) return { buffer: framed, contentType: 'image/png', filename: 'portrait.png' };
@@ -840,26 +840,29 @@ function buildAvatarSystemPrompt(ctx, languageCode = 'en', opts = {}) {
 
   const memText = (ctx.memories || []).slice(0, maxMemories).map((m) => {
     const who = (m.people_involved || []).join(', ');
-    return `- [${m.certainty || 'accurate'}] ${m.title || 'Memory'}${m.year ? ` (${m.year})` : ''}: ${clip(m.summary, liveMode ? 180 : 400)}${m.lesson_learned ? ` Lesson: ${clip(m.lesson_learned, 120)}.` : ''}${who ? ` People: ${who}.` : ''}`;
+    return `- [${m.certainty || 'accurate'}] ${m.title || 'Memory'}${m.year ? ` (${m.year})` : ''}: ${clip(m.summary, liveMode ? 420 : 400)}${m.lesson_learned ? ` Lesson: ${clip(m.lesson_learned, 160)}.` : ''}${who ? ` People: ${who}.` : ''}`;
   }).join('\n') || '(no specific memories preserved yet)';
 
   // Live mode: keep people even when story memories are clipped.
   const relLimit = liveMode ? Math.max(maxRelationships, 8) : maxRelationships;
   const relText = (ctx.relationships || []).slice(0, relLimit).map((r) =>
-    `- ${r.name} (${r.relationship_type || 'relationship'}): ${clip(r.relationship_summary || r.description, liveMode ? 140 : 280)}`,
+    `- ${r.name} (${r.relationship_type || 'relationship'}): ${clip(r.relationship_summary || r.description, 280)}`,
   ).join('\n') || '(none preserved yet)';
 
   const valText = (ctx.values || []).slice(0, maxValues).map((v) =>
-    `- ${v.value_name}${v.is_core ? ' (core)' : ''}: ${clip(v.description, liveMode ? 100 : 220)}`,
+    `- ${v.value_name}${v.is_core ? ' (core)' : ''}: ${clip(v.description, 220)}`,
   ).join('\n') || '(none preserved yet)';
 
   const wisText = (ctx.wisdom || []).slice(0, maxWisdom).map((w) =>
-    `- ${clip(w.advice_statement, liveMode ? 140 : 280)}${w.life_category ? ` [${w.life_category}]` : ''}`,
+    `- ${clip(w.advice_statement, 280)}${w.life_category ? ` [${w.life_category}]` : ''}`,
   ).join('\n') || '(none preserved yet)';
 
   const lengthRule = liveMode
-    ? '6. Keep replies VERY SHORT for live video — 1 to 3 spoken sentences MAX. Never monologue, never dump a long story, never use lists. Answer, then stop and listen. Do NOT end with a question unless they asked you one. If they say "don\'t ask questions" or "just answer", obey for the rest of the call.'
-    : '6. Keep replies SHORT and spoken — 2 to 4 sentences. They will be voiced aloud by your avatar. Answer, then stop. Do not tack on a follow-up question unless they invited one.';
+    ? `6. LENGTH. A normal answer is one connected turn of about 3 to 5 sentences, spoken as a person telling a story, not a headline and not a list. Do not stop after a single short fragment.
+   If they ask you to expand, go on, say more, tell the whole story, or explain, you MUST continue. Use the preserved memory and the interview words you have not said yet. Give a short story, about 6 to 10 sentences. Staying at one clipped line after they asked for more is a failure.
+   Still do not invent facts that are not written below. If the archive really has nothing more on that subject, say that plainly in one or two sentences.
+   Do NOT end with a question unless they asked you one. If they say "don't ask questions" or "just answer", obey for the rest of the call.`
+    : '6. Keep replies spoken — a short paragraph, not a headline. They will be voiced aloud. If they ask you to say more, tell more of what is preserved. Do not tack on a follow-up question unless they invited one.';
 
   const identityLines = (ctx.identityAnswers || []).map((a) => {
     const label = a.module || a.category || 'Background';
@@ -897,10 +900,10 @@ HARD RULES — personal background accuracy:
    d. Values/personality may color tone only ("Knowing me, I'd care about…") — NEVER invent a concrete life event, person, place, or date.
    e. If you have nothing, say so ("We never got to talk about that one").
 ${lengthRule}
-7. Write the way you'd actually speak aloud: short sentences, natural pauses (commas), contractions, and a warm conversational rhythm. Avoid bullet points, lists, or formal written tone.
+7. Write the way you'd actually speak aloud: connected sentences that follow one another, contractions, and a warm conversational rhythm. Avoid bullet points, lists, or a string of isolated one-liners.
 8. Stay in character. Never mention being an AI, a model, or "preserved data."
 9. ${languageReplyHint(languageCode)}
-10. Prefer fewer true words over a richer false story. When unsure, under-claim.
+10. Prefer true words over a richer false story. When they ask for more, say more of what is already preserved. When unsure, under-claim. Do not invent a detail to fill a longer answer.
 11. Honor TOPIC EXCLUSIONS below without exception.
 12. Do not close a turn with a question. Statements only, unless they asked you a question and you need one clarifying word. If they said "don't ask questions", never ask again.
 
@@ -1047,7 +1050,7 @@ CALL OPENING: When the call starts you will be asked to greet them. Say this gre
 router.post('/live/speech', async (req, res) => {
   const grant = verifySpeechTicket(req.body?.ticket, req.user?.id);
   if (!grant) return res.status(401).json({ error: 'This live call has expired. Start the call again.' });
-  const text = String(req.body?.text || '').trim().slice(0, 600);
+  const text = String(req.body?.text || '').trim().slice(0, 1200);
   if (!text) return res.status(400).json({ error: 'text required' });
 
   const upstreamAbort = new AbortController();
@@ -1092,7 +1095,7 @@ router.post('/live/reply', async (req, res) => {
   const history = Array.isArray(req.body?.history) ? req.body.history.slice(-8) : [];
   const lines = history
     .filter((turn) => turn && (turn.role === 'user' || turn.role === 'assistant') && turn.text)
-    .map((turn) => `${turn.role === 'user' ? 'Visitor' : 'You'}: ${String(turn.text).trim().slice(0, 400)}`)
+    .map((turn) => `${turn.role === 'user' ? 'Visitor' : 'You'}: ${String(turn.text).trim().slice(0, 900)}`)
     .join('\n');
 
   try {
@@ -1107,9 +1110,10 @@ router.post('/live/reply', async (req, res) => {
       maxWisdom: 6,
     })}
 
-This is a live video call. Answer in one or two short spoken sentences. No lists, no stage directions.`;
+This is a live video call. Speak in connected sentences. A normal reply is a short paragraph. If the visitor asks you to expand or tell more, tell more of the preserved story. No lists, no stage directions.`;
     const userMessage = `${lines ? `${lines}\n` : ''}Visitor: ${text}`;
-    const { text: answer } = await callClaude({ system, userMessage, maxTokens: 180 });
+    const wantsMore = /\b(expand|elaborate|longer|go on|keep going|tell me more|the whole|entire story|explain more)\b|הרחב|תפרט|תמשיך|תספר|עוד|כל הסיפור/i.test(`${text}\n${lines}`);
+    const { text: answer } = await callClaude({ system, userMessage, maxTokens: wantsMore ? 700 : 420 });
     res.json({ text: String(answer || '').trim() });
   } catch (e) {
     console.error('[avatar/live/reply] failed:', e.message);

@@ -74,7 +74,7 @@ export async function createLiveRealtimeSecret({ instructions, languageCode }) {
         },
       },
     },
-    max_output_tokens: realtimeNumberEnv('OPENAI_LIVE_MAX_TOKENS', 220),
+    max_output_tokens: realtimeNumberEnv('OPENAI_LIVE_MAX_TOKENS', 600),
   };
 
   const res = await fetch('https://api.openai.com/v1/realtime/client_secrets', {

@@ -13,7 +13,7 @@
 const BASE_URL = 'https://api.simli.ai';
 
 function apiKey() {
-  const key = process.env.SIMLI_API_KEY;
+  const key = String(process.env.SIMLI_API_KEY || '').trim();
   if (!key) throw new Error('SIMLI_API_KEY not configured');
   return key;
 }
@@ -52,7 +52,8 @@ function portraitForm({ buffer, contentType, filename }) {
 }
 
 function faceCreatePath() {
-  return process.env.SIMLI_FACE_MODEL === 'trinity' ? '/faces/trinity' : '/faces/legacy';
+  // Legacy face servers now answer "no available server". Trinity is Simli's current model.
+  return process.env.SIMLI_FACE_MODEL === 'legacy' ? '/faces/legacy' : '/faces/trinity';
 }
 
 /** Reframe a portrait to the head-and-shoulders framing Trinity expects. Returns PNG bytes. */
@@ -78,16 +79,31 @@ async function postFace(path, { name, buffer, contentType, filename }) {
 
 /**
  * Start generating a face from the portrait. Generation is async — poll faceStatus().
- * Default is Simli's legacy face model: Trinity/GS is blocked on free accounts.
- * Set SIMLI_FACE_MODEL=trinity to use the newer model after upgrading.
+ * Trinity is the default. Set SIMLI_FACE_MODEL=legacy only to force the old model.
+ * A full Trinity plan returns 403, and a model whose servers are down returns 503;
+ * either one tries the other model before failing.
  */
 export async function createFace({ name, buffer, contentType = 'image/jpeg', filename = 'portrait.jpg' }) {
   const preferred = faceCreatePath();
+  const payload = { name, buffer, contentType, filename };
   try {
-    return pickFaceId(await postFace(preferred, { name, buffer, contentType, filename }));
+    return pickFaceId(await postFace(preferred, payload));
   } catch (e) {
-    if (preferred === '/faces/trinity' && e.status === 403) {
-      return pickFaceId(await postFace('/faces/legacy', { name, buffer, contentType, filename }));
+    const other = preferred === '/faces/trinity' ? '/faces/legacy' : '/faces/trinity';
+    const modelDown = e.status === 503 || e.status === 502;
+    const trinityBlocked = preferred === '/faces/trinity' && e.status === 403;
+    if (modelDown || trinityBlocked) {
+      try {
+        return pickFaceId(await postFace(other, payload));
+      } catch (fallbackErr) {
+        if (fallbackErr.status === 401) {
+          throw new Error('Simli rejected the API key. Create a new key in the Simli dashboard and replace SIMLI_API_KEY.');
+        }
+        throw fallbackErr;
+      }
+    }
+    if (e.status === 401) {
+      throw new Error('Simli rejected the API key. Create a new key in the Simli dashboard and replace SIMLI_API_KEY.');
     }
     throw e;
   }
